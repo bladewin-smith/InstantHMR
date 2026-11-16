@@ -69,6 +69,8 @@ def main() -> int:
     p.add_argument("--camera", action="store_true", help="open Gemini 2 and acquire one RGB frame")
     p.add_argument("--hmr-smoke", action="store_true",
                    help="download/load small-fit1 and run one CUDA prediction with the Jetson graph fix")
+    p.add_argument("--cuda-conv-algo", choices=("EXHAUSTIVE", "HEURISTIC", "DEFAULT"),
+                   default="HEURISTIC", help="cuDNN search used by --hmr-smoke (default: HEURISTIC)")
     p.add_argument("--serial", help="Orbbec serial number when more than one camera is connected")
     args = p.parse_args()
     failed = False
@@ -187,7 +189,7 @@ def main() -> int:
             from instanthmr.models import resolve_model
 
             hmr = InstantHMR(resolve_model("small", 1), device="cuda", max_batch=1, return_mesh=False,
-                             cuda_conv_algo="HEURISTIC", rewrite_asymmetric_padding=True)
+                             cuda_conv_algo=args.cuda_conv_algo, rewrite_asymmetric_padding=True)
             hmr.warmup(1)
             print(f"HMR smoke: small-fit1 prediction OK on {hmr.provider}")
         except Exception as e:

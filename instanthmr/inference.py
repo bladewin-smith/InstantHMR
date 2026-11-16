@@ -81,15 +81,10 @@ def providers_for(device: str, max_batch: int = 1, image_size: int = 288,
     return ["CPUExecutionProvider"]
 
 
-def _session_options(ort, preserve_explicit_padding: bool = False):
+def _session_options(ort):
     options = ort.SessionOptions()
     options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     options.log_severity_level = 3
-    if preserve_explicit_padding:
-        # ORT's PadFusion (and the CPU NCHWc layout rewrite) would otherwise fold our explicit
-        # Pad back into the Conv and recreate the asymmetric graph this compatibility path avoids.
-        options.add_session_config_entry("optimization.disable_specified_optimizers",
-                                         "PadFusion;NchwcTransformer")
     return options
 
 
@@ -121,7 +116,7 @@ class InstantHMR:
         if hasattr(ort, "preload_dlls"):
             ort.preload_dlls()
         ort.set_default_logger_severity(3)
-        options = _session_options(ort, preserve_explicit_padding=rewrite_asymmetric_padding)
+        options = _session_options(ort)
 
         source_model_path = Path(model_path)
         body_path = Path(body_path) if body_path else resolve_body(source_model_path)

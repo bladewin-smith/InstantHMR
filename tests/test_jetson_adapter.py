@@ -14,7 +14,7 @@ import numpy as np
 from demo import parse_args
 from instanthmr.camera_orbbec import OrbbecGemini2Source, _frame_to_rgb
 from instanthmr.detector import PersonDetector
-from instanthmr.inference import HMRPrediction, InstantHMR, _fit_providers, _session_options, providers_for
+from instanthmr.inference import HMRPrediction, InstantHMR, _fit_providers, providers_for
 from instanthmr.onnx_compat import rewrite_asymmetric_conv_padding
 from tools.check_jetson import classify_stack, dependency_pin_issues
 
@@ -179,21 +179,6 @@ class ProviderTests(unittest.TestCase):
             "enable_cuda_graph": "1", "cudnn_conv_algo_search": "HEURISTIC",
         }))
 
-    def test_compat_session_preserves_explicit_padding(self):
-        class Options:
-            def __init__(self):
-                self.config = {}
-
-            def add_session_config_entry(self, key, value):
-                self.config[key] = value
-
-        fake = types.SimpleNamespace(SessionOptions=Options,
-                                     GraphOptimizationLevel=types.SimpleNamespace(ORT_ENABLE_ALL=99))
-        options = _session_options(fake, preserve_explicit_padding=True)
-        self.assertEqual(options.config["optimization.disable_specified_optimizers"],
-                         "PadFusion;NchwcTransformer")
-
-
 @unittest.skipUnless(importlib.util.find_spec("onnx"), "onnx is only required by the Jetson deployment")
 class OnnxCompatibilityTests(unittest.TestCase):
     def test_asymmetric_conv_is_rewritten_and_numerically_equivalent(self):
@@ -219,10 +204,27 @@ class OnnxCompatibilityTests(unittest.TestCase):
             actual = ReferenceEvaluator(rewritten).run(None, {"x": sample})[0]
 
             np.testing.assert_allclose(actual, expected)
-            self.assertEqual([node.op_type for node in rewritten.graph.node], ["Pad", "Conv"])
-            pads = next(attr.ints for attr in rewritten.graph.node[1].attribute if attr.name == "pads")
-            self.assertEqual(list(pads), [0, 0, 0, 0])
+            self.assertEqual([node.op_type for node in rewritten.graph.node], ["Conv", "Slice"])
+            pads = next(attr.ints for attr in rewritten.graph.node[0].attribute if attr.name == "pads")
+            self.assertEqual(list(pads), [1, 1, 1, 1])
             self.assertEqual(rewrite_asymmetric_conv_padding(source, root / "cache"), rewritten_path)
+
+            if importlib.util.find_spec("onnxruntime"):
+                import onnxruntime as ort
+
+                optimized_path = root / "optimized.onnx"
+                options = ort.SessionOptions()
+                options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+                options.optimized_model_filepath = str(optimized_path)
+                ort.InferenceSession(str(rewritten_path), sess_options=options,
+                                     providers=["CPUExecutionProvider"])
+                optimized = onnx.load(optimized_path)
+                asymmetric = [
+                    list(attr.ints) for node in optimized.graph.node if node.op_type == "Conv"
+                    for attr in node.attribute if attr.name == "pads"
+                    and list(attr.ints[:len(attr.ints) // 2]) != list(attr.ints[len(attr.ints) // 2:])
+                ]
+                self.assertEqual(asymmetric, [])
 
 
 class CliTests(unittest.TestCase):

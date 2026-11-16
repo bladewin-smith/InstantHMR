@@ -7,17 +7,17 @@ import uuid
 from pathlib import Path
 
 
-_ASYMMETRIC_PAD_PATCH_VERSION = 1
+_ASYMMETRIC_PAD_PATCH_VERSION = 2
 
 
 def rewrite_asymmetric_conv_padding(model_path: str | Path,
                                     cache_dir: str | Path = "models/onnx_compat") -> Path:
-    """Return a cached graph whose asymmetric Conv padding is an explicit zero Pad.
+    """Return a cached graph whose asymmetric Conv is a symmetric Conv followed by Slice.
 
     cuDNN 9.6's frontend can fail to create an engine for otherwise valid FP16 convolutions with
-    different leading/trailing padding.  An ONNX Pad followed by an unpadded Conv is mathematically
-    identical and is accepted by both the CUDA and TensorRT execution providers.  The source graph
-    is never modified.
+    different leading/trailing padding.  Padding both sides equally and slicing off the additional
+    border is mathematically identical, while cuDNN only sees the supported symmetric convolution.
+    The source graph is never modified.
     """
     source = Path(model_path).resolve()
     stat = source.stat()
@@ -40,8 +40,8 @@ def rewrite_asymmetric_conv_padding(model_path: str | Path,
 
     model = onnx.load(str(source), load_external_data=True)
     default_opset = next((item.version for item in model.opset_import if item.domain in ("", "ai.onnx")), 0)
-    if default_opset < 11:
-        raise RuntimeError(f"cannot rewrite {source.name}: ONNX Pad inputs require opset 11+, got {default_opset}")
+    if default_opset < 10:
+        raise RuntimeError(f"cannot rewrite {source.name}: ONNX Slice inputs require opset 10+, got {default_opset}")
 
     rewritten_nodes = []
     rewritten = 0
@@ -53,19 +53,28 @@ def rewrite_asymmetric_conv_padding(model_path: str | Path,
                       and pads[:spatial_rank] != pads[spatial_rank:])
         if node.op_type == "Conv" and asymmetric:
             prefix = f"__instanthmr_asymmetric_pad_{index}"
-            pads_name, output_name = f"{prefix}_values", f"{prefix}_output"
-            full_pads = [0, 0, *pads[:spatial_rank], 0, 0, *pads[spatial_rank:]]
-            model.graph.initializer.append(
-                helper.make_tensor(pads_name, TensorProto.INT64, [len(full_pads)], full_pads)
-            )
-            rewritten_nodes.append(helper.make_node(
-                "Pad", [node.input[0], pads_name], [output_name], name=prefix, mode="constant"
-            ))
-            node.input[0] = output_name
+            starts_name, ends_name, axes_name = (f"{prefix}_starts", f"{prefix}_ends", f"{prefix}_axes")
+            original_output, conv_output = node.output[0], f"{prefix}_conv_output"
+            leading, trailing = pads[:spatial_rank], pads[spatial_rank:]
+            symmetric = [max(a, b) for a, b in zip(leading, trailing)]
+            starts = [s - a for s, a in zip(symmetric, leading)]
+            ends = [-(s - b) if s != b else 2 ** 63 - 1 for s, b in zip(symmetric, trailing)]
+            axes = list(range(2, 2 + spatial_rank))
+            for name, values in ((starts_name, starts), (ends_name, ends), (axes_name, axes)):
+                model.graph.initializer.append(
+                    helper.make_tensor(name, TensorProto.INT64, [len(values)], values)
+                )
+            node.output[0] = conv_output
             del pads_attr.ints[:]
-            pads_attr.ints.extend([0] * (2 * spatial_rank))
+            pads_attr.ints.extend([*symmetric, *symmetric])
+            rewritten_nodes.append(node)
+            rewritten_nodes.append(helper.make_node(
+                "Slice", [conv_output, starts_name, ends_name, axes_name], [original_output],
+                name=f"{prefix}_slice"
+            ))
             rewritten += 1
-        rewritten_nodes.append(node)
+        else:
+            rewritten_nodes.append(node)
 
     if rewritten == 0:
         return source
@@ -87,5 +96,5 @@ def rewrite_asymmetric_conv_padding(model_path: str | Path,
         os.replace(temporary, target)
     finally:
         temporary.unlink(missing_ok=True)
-    print(f"Jetson ONNX compatibility: rewrote {rewritten} asymmetric Conv padding node(s) -> {target}")
+    print(f"Jetson ONNX compatibility: rewrote {rewritten} asymmetric Conv as symmetric Conv + Slice -> {target}")
     return target

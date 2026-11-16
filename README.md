@@ -252,10 +252,11 @@ Unlike an ordinary `--camera 0`, `--orbbec` uses Orbbec SDK hardware timestamps 
 colour profile's real calibration. The released ONNX graph accepts one focal value, so the adapter
 uses `(fx + fy) / 2` and passes the real `cx/cy` to CLIFF and the in-graph kinematic fit.
 
-On the first run, the fix changes each asymmetric Conv into the mathematically equivalent explicit
-zero Pad plus unpadded Conv and caches the result in `models/onnx_compat/`. The downloaded model is
-never overwritten. This avoids the `CUDNN_FE ... HEURISTIC_QUERY_FAILED` failure seen with cuDNN
-9.6 on the first FP16 stem convolution; later runs reuse the cached graph.
+On the first run, the fix changes each asymmetric Conv into a symmetric Conv followed by a Slice
+that removes the additional border, and caches the equivalent graph in `models/onnx_compat/`. This
+form cannot be folded back into the unsupported asymmetric convolution by ORT 1.20. The downloaded
+model is never overwritten. It avoids the `CUDNN_FE ... HEURISTIC_QUERY_FAILED` failure seen with
+cuDNN 9.6 on the first FP16 stem convolution; later runs reuse the cached graph.
 
 For the local Rerun UI, omit `--no-viewer`:
 
@@ -356,7 +357,8 @@ faithful InstantHMR reproduction.
   repository, install the updated `requirements-jetson.txt` (it adds ONNX 1.17.0), and keep
   `--jetson` enabled. Do not replace JetPack's cuDNN independently. For diagnosis only,
   `--no-onnx-pad-fix` disables the rewrite and `--cuda-conv-algo DEFAULT` selects cuDNN's much
-  slower fallback search.
+  slower fallback search. The smoke-test equivalent is
+  `python tools/check_jetson.py --hmr-smoke --cuda-conv-algo DEFAULT`.
 - **TensorRT engine fails after an upgrade:** remove only `models/trt_cache/` and let this device
   rebuild it. Engine files are hardware and software-stack specific.
 - **First run cannot download weights:** download the ONNX graphs and `mhr-body.onnx` on a connected
