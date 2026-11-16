@@ -1,12 +1,31 @@
-# Verified deployment: Jetson Orin / JetPack 6, Python 3.10, CUDA 12.6, cuDNN 9.6.
-# Create the environment with --system-site-packages so pip reuses NVIDIA's torch,
-# torchvision, ONNX Runtime and TensorRT packages. Do not install this into a clean venv.
--r requirements.txt
-
-# Keep the ABI-compatible versions already verified on the target. The exact pins also stop
-# transitive dependencies from replacing JetPack's NumPy/OpenCV or the custom ARM64 ORT wheel.
+# Jetson Orin / JetPack 6, Python 3.10, CUDA 12.6, cuDNN 9.6.
+# This list is deliberately independent of requirements.txt: current desktop RF-DETR/Rerun
+# releases require PyTorch >=2.6 and NumPy >=2, while NVIDIA's JP6 stack provides PyTorch 2.5
+# and this ROS/Orbbec deployment requires NumPy 1.26.  Create the venv with
+# --system-site-packages so NVIDIA torch/vision/ORT/TensorRT remain visible.
 numpy==1.26.4
 opencv-python==4.10.0.84
-rfdetr==1.12.1
+opencv-python-headless==4.10.0.84
+
+# RF-DETR 1.6+ requires Transformers 5, whose model backend rejects torch 2.5.  1.5.1 is the
+# last RF-DETR release on Transformers 4 and still provides RFDETRNano + legacy inference API.
+rfdetr==1.5.1
+transformers==4.57.3
+huggingface-hub==0.36.0
+tokenizers==0.22.1
+
+# Orbbec pins PyAV 12.3 exactly.  Supervision 0.30+ instead requires PyAV >=14.2, so 0.29.1
+# is the newest satisfiable RF-DETR result type for this camera environment.
+supervision==0.29.1
+av==12.3.0
 pyorbbecsdk2==2.1.1
+
+# Rerun 0.23+ requires NumPy 2.  The visualizer contains compatibility shims for 0.22.1.
+rerun-sdk==0.22.1
+
+# Keep the HTTP stack internally consistent without downgrading h11.
+httpcore==1.0.9
+h11==0.16.0
+
+# This is normally already supplied by the system JetPack installation.
 onnxruntime-gpu==1.20.0 ; platform_system == "Linux" and platform_machine == "aarch64" and python_version < "3.11"

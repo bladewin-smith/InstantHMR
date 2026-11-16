@@ -101,6 +101,7 @@ The primary environment is the stack verified on the target device:
 - CUDA 12.6, cuDNN 9.6, NVIDIA PyTorch 2.5.0a0 (24.08) and torchvision 0.20.0a0;
 - ONNX Runtime GPU 1.20.0 with TensorRT, CUDA and CPU providers, and TensorRT 10.7.0;
 - `pyorbbecsdk2` wrapper 2.1.1 / Orbbec SDK runtime 2.8.6;
+- RF-DETR 1.5.1, Transformers 4.57.3, Supervision 0.29.1 and PyAV 12.3.0;
 - Gemini 2 firmware 1.4.98, verified at RGB 1280x720 at 30 fps over USB 3.
 
 This is a JetPack 6 / Ubuntu 22.04-generation environment. JetPack 7 uses Python 3.12 and CUDA 13,
@@ -142,10 +143,33 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements-jetson.txt
 ```
 
-The JetPack 6 file pins the versions verified on the device: NumPy 1.26.4, OpenCV 4.10,
-RF-DETR 1.12.1, `pyorbbecsdk2` 2.1.1 and ORT 1.20.0. The ORT requirement is satisfied by the
-system-visible custom ARM64 installation; pip must not replace it. Do not run `pip install torch`,
-`torchvision`, `onnxruntime-gpu`, `tensorrt` or `numpy --upgrade` separately.
+Confirm that `which python` points inside `.venv-jp6`. A traceback under
+`/home/jetson/.local/lib/python3.10/site-packages` means the project venv is not active; do not keep
+repairing that shared user environment. If it was already polluted, create a new venv with a new
+name rather than layering more upgrades on it:
+
+```bash
+python3 -m venv --system-site-packages .venv-jp6-v2
+source .venv-jp6-v2/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements-jetson.txt
+```
+
+The JetPack 6 file is intentionally independent of the desktop `requirements.txt` and pins NumPy
+1.26.4, OpenCV 4.10, RF-DETR 1.5.1, Transformers 4.57.3, Hugging Face Hub 0.36.0,
+Supervision 0.29.1, PyAV 12.3.0, Rerun 0.22.1, `pyorbbecsdk2` 2.1.1 and ORT 1.20.0. These older
+versions are deliberate compatibility boundaries:
+
+- RF-DETR 1.6 and newer require Transformers 5; Transformers 5 disables its PyTorch model backend
+  on the NVIDIA 2.5.0a0 build because it requires PyTorch 2.6 or newer.
+- `pyorbbecsdk2` 2.1.1 requires PyAV 12.3.0 exactly, while Supervision 0.30 and newer require
+  PyAV 14.2 or newer. RF-DETR 1.5.1 works with Supervision 0.29.1, which has no PyAV requirement.
+- Rerun 0.23 and newer require NumPy 2. Rerun 0.22.1 is the newest release compatible with this
+  NumPy 1.26 deployment; InstantHMR includes shims for its older timeline and blueprint APIs.
+
+The ORT requirement is normally satisfied by the system-visible custom ARM64 installation; pip
+must not replace it. Do not run `pip install torch`, `torchvision`, `onnxruntime-gpu`, `tensorrt`,
+`rfdetr`, `transformers`, `supervision`, `av`, `rerun-sdk` or `numpy --upgrade` separately.
 
 The base system currently contains unrelated `pip check` conflicts from airo (which requests NumPy
 2) and old TensorFlow companion packages. They are not InstantHMR dependencies. Keep NumPy 1.26.4
@@ -171,9 +195,9 @@ python tools/check_jetson.py
 
 On the verified device the required lines are CUDA 12.6, cuDNN 90600, ORT 1.20.0 with
 `TensorrtExecutionProvider` and `CUDAExecutionProvider`, and `stack: JetPack 6 / CUDA 12`. The check
-also verifies a real CUDA allocation, torchvision, RF-DETR, NumPy/OpenCV and distinguishes the
-Orbbec Python-wrapper version from its bundled SDK runtime. A missing Rerun install is only allowed
-with `--no-viewer` and without `--save-rrd`.
+also verifies a real CUDA allocation, torchvision, the complete RF-DETR/Transformers/Supervision/
+PyAV pin set, NumPy/OpenCV and distinguishes the Orbbec Python-wrapper version from its bundled SDK
+runtime. A missing Rerun install is only allowed with `--no-viewer` and without `--save-rrd`.
 
 #### 3. Configure and verify Gemini 2
 
@@ -264,9 +288,11 @@ do not install the JetPack 7 ORT 1.32 package or desktop `tensorrt-cu12` over Je
 `--no-viewer` now skips Rerun initialization and per-frame serialization unless `--save-rrd` is
 also present. `--no-mesh` now also skips the 18,439-vertex MHR body output instead of merely hiding
 it. Live sources retain only the latest 1,800 timing samples rather than growing an unbounded list.
-RF-DETR 1.12 uses its prediction-only object with compilation disabled on Jetson, avoiding a second
-CUDA-graph/Inductor memory pool on the 8 GB device. These are useful recovery options if the process
-is killed under memory pressure.
+RF-DETR 1.5.1 uses its legacy inference optimizer with TorchScript compilation disabled on Jetson,
+avoiding a trace-time allocation and NVIDIA-wheel compatibility risk on the 8 GB device. Newer
+RF-DETR releases use a different prediction object; the adapter supports both, but they are not part
+of the JetPack 6 dependency set. These are useful recovery options if the process is killed under
+memory pressure.
 
 Gemini 2 is an RGB-D camera, but InstantHMR is trained as a monocular RGB model. This adapter does
 not replace `cam_trans` with a depth-box median: that measures the visible clothing surface rather
@@ -288,6 +314,14 @@ faithful InstantHMR reproduction.
   and the installed ORT wheel must match JetPack's CUDA/TensorRT ABI.
 - **`RF-DETR is not installed`:** activate `.venv-jp6` and rerun
   `python -m pip install -r requirements-jetson.txt`; do not install a replacement torch wheel.
+- **`BackboneConfigMixin` import error or “Disabling PyTorch because PyTorch >= 2.6 is required”:**
+  RF-DETR 1.12 / Transformers 5 leaked in from the shared user environment. Create a fresh
+  `--system-site-packages` venv, confirm `which python` points into it, and install the JetPack 6
+  requirements file. The expected pair is RF-DETR 1.5.1 / Transformers 4.57.3.
+- **PyAV conflict between Orbbec and Supervision:** keep PyAV 12.3.0 and Supervision 0.29.1. Do not
+  satisfy Supervision 0.30+'s PyAV 14.2 request in the camera environment.
+- **Rerun asks for NumPy 2:** use the pinned Rerun 0.22.1. Newer Rerun belongs on a workstation or
+  in a separate environment, not in this ROS/Orbbec JetPack 6 venv.
 - **Global `pip check` reports airo/TensorFlow conflicts:** these are pre-existing packages outside
   InstantHMR. Do not upgrade NumPy to 2 or downgrade the NVIDIA TensorFlow stack for this project;
   use the project venv and validate with `tools/check_jetson.py`.

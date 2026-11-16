@@ -33,9 +33,15 @@ class RerunVisualizer:
     def log(self, frame: int, image_rgb: np.ndarray, persons: Sequence[HMRPrediction],
             timings: dict[str, float]) -> None:
         rr = self.rr
-        rr.set_time("frame", sequence=frame)
+        # Rerun 0.22 is the last ARM64 release compatible with JetPack 6's NumPy 1.26
+        # and uses the older timeline/scalar names. Keep current desktop releases working too.
+        if hasattr(rr, "set_time"):
+            rr.set_time("frame", sequence=frame)
+        else:
+            rr.set_time_sequence("frame", frame)
+        scalar = getattr(rr, "Scalars", None) or rr.Scalar
         for name, ms in timings.items():
-            rr.log(f"timing/{name}", rr.Scalars(float(ms)))
+            rr.log(f"timing/{name}", scalar(float(ms)))
         for stale in range(len(persons), self._n_logged):
             rr.log(f"world/person_{stale}", rr.Clear(recursive=True))
         self._n_logged = len(persons)
@@ -65,13 +71,15 @@ class RerunVisualizer:
 
         centre = first.joints_3d_cam.mean(0)
         distance = max(4 * float(np.abs(first.joints_3d_cam - centre).max()), 1.5)
+        view_3d_kwargs = dict(origin="/", name="3D", background=rrb.Background(color=[25, 25, 25]))
+        if hasattr(rrb, "EyeControls3D"):
+            view_3d_kwargs["eye_controls"] = rrb.EyeControls3D(
+                position=[float(centre[0]), float(centre[1]), float(centre[2] - distance)],
+                look_target=centre.tolist(), eye_up=[0.0, -1.0, 0.0], kind=rrb.Eye3DKind.Orbital)
         self.rr.send_blueprint(rrb.Blueprint(rrb.Horizontal(
             rrb.Vertical(rrb.Spatial2DView(origin="camera/image", name="Camera"),
                          rrb.TimeSeriesView(origin="timing", name="Latency (ms)"), row_shares=[3, 1]),
-            rrb.Spatial3DView(origin="/", name="3D", background=rrb.Background(color=[25, 25, 25]),
-                              eye_controls=rrb.EyeControls3D(
-                                  position=[float(centre[0]), float(centre[1]), float(centre[2] - distance)],
-                                  look_target=centre.tolist(), eye_up=[0.0, -1.0, 0.0], kind=rrb.Eye3DKind.Orbital)),
+            rrb.Spatial3DView(**view_3d_kwargs),
             column_shares=[2, 3])))
 
 

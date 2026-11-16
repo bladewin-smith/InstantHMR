@@ -33,7 +33,9 @@ class PersonDetector:
         elif hasattr(model, "optimize_for_inference"):     # legacy RF-DETR
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                predictor = model.optimize_for_inference()
+                # RF-DETR 1.5.x uses TorchScript when ``compile=True``.  Keep the same
+                # Jetson memory/ABI safety contract as the newer ``inference`` API.
+                predictor = model.optimize_for_inference(compile=compile_model)
             self.model = predictor if predictor is not None else model
         else:
             self.model = model

@@ -30,6 +30,30 @@ def package_version(distribution: str) -> str | None:
         return None
 
 
+JP6_DETECTOR_PINS = {
+    "rfdetr": "1.5.1",
+    "transformers": "4.57.3",
+    "huggingface-hub": "0.36.0",
+    "tokenizers": "0.22.1",
+    "supervision": "0.29.1",
+    "av": "12.3.0",
+}
+
+
+def dependency_pin_issues(requirements: str | None) -> list[str]:
+    """Return actionable incompatibilities before importing the detector dependency graph."""
+    if requirements != "requirements-jetson.txt":
+        return []
+    issues = []
+    for distribution, expected in JP6_DETECTOR_PINS.items():
+        actual = package_version(distribution)
+        if actual is None:
+            issues.append(f"{distribution} is missing (expected {expected})")
+        elif actual != expected:
+            issues.append(f"{distribution} {actual} is incompatible (expected {expected})")
+    return issues
+
+
 def l4t_release() -> str | None:
     release = Path("/etc/nv_tegra_release")
     try:
@@ -122,6 +146,14 @@ def main() -> int:
         print(f"ERROR: cannot import NumPy/OpenCV: {e}")
         failed = True
 
+    pin_issues = dependency_pin_issues(requirements)
+    if pin_issues:
+        for issue in pin_issues:
+            print(f"ERROR: detector dependency: {issue}")
+        print("ERROR: recreate .venv-jp6 and install requirements-jetson.txt; "
+              "RF-DETR 1.6+ / Transformers 5 cannot use JetPack 6 torch 2.5")
+        failed = True
+
     rfdetr_version = package_version("rfdetr")
     if rfdetr_version is None:
         print("ERROR: RF-DETR is not installed; install the matching Jetson requirements file")
@@ -141,6 +173,9 @@ def main() -> int:
             failed = True
     rerun_version = package_version("rerun-sdk")
     print(f"Rerun:    {rerun_version or 'not installed (only --no-viewer without --save-rrd works)'}")
+    if requirements == "requirements-jetson.txt" and rerun_version and rerun_version != "0.22.1":
+        print(f"ERROR: Rerun {rerun_version} is incompatible with the JP6 NumPy 1.26 pin; use 0.22.1")
+        failed = True
 
     if args.camera:
         try:

@@ -12,7 +12,7 @@ from demo import parse_args
 from instanthmr.camera_orbbec import OrbbecGemini2Source, _frame_to_rgb
 from instanthmr.detector import PersonDetector
 from instanthmr.inference import HMRPrediction, InstantHMR
-from tools.check_jetson import classify_stack
+from tools.check_jetson import classify_stack, dependency_pin_issues
 
 
 class _Formats:
@@ -179,6 +179,26 @@ class JetsonEnvironmentTests(unittest.TestCase):
         self.assertEqual(stack, "JetPack 7 / CUDA 13")
         self.assertEqual(requirements, "requirements-jetson-jp7.txt")
 
+    @patch("tools.check_jetson.package_version")
+    def test_rejects_transformers_5_on_verified_jetpack_6(self, package_version):
+        versions = {
+            "rfdetr": "1.12.1", "transformers": "5.20.2", "huggingface-hub": "2.4.0",
+            "tokenizers": "0.23.3", "supervision": "0.29.1", "av": "12.3.0",
+        }
+        package_version.side_effect = versions.get
+        issues = dependency_pin_issues("requirements-jetson.txt")
+        self.assertTrue(any("rfdetr 1.12.1" in issue for issue in issues))
+        self.assertTrue(any("transformers 5.20.2" in issue for issue in issues))
+
+    @patch("tools.check_jetson.package_version")
+    def test_accepts_complete_jetpack_6_detector_pin_set(self, package_version):
+        versions = {
+            "rfdetr": "1.5.1", "transformers": "4.57.3", "huggingface-hub": "0.36.0",
+            "tokenizers": "0.22.1", "supervision": "0.29.1", "av": "12.3.0",
+        }
+        package_version.side_effect = versions.get
+        self.assertEqual(dependency_pin_issues("requirements-jetson.txt"), [])
+
 
 class DetectorCompatibilityTests(unittest.TestCase):
     def test_new_rfdetr_uses_uncompiled_inference_object(self):
@@ -200,14 +220,17 @@ class DetectorCompatibilityTests(unittest.TestCase):
     def test_legacy_rfdetr_keeps_in_place_model(self):
         class Model:
             optimized = False
+            compile = None
 
-            def optimize_for_inference(self):
+            def optimize_for_inference(self, compile=True):
                 self.optimized = True
+                self.compile = compile
 
         fake = types.SimpleNamespace(RFDETRNano=Model)
         with patch.dict(sys.modules, {"rfdetr": fake}):
-            detector = PersonDetector("nano")
+            detector = PersonDetector("nano", compile_model=False)
         self.assertTrue(detector.model.optimized)
+        self.assertFalse(detector.model.compile)
 
 
 if __name__ == "__main__":
