@@ -257,13 +257,20 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.trt_workspace_gb, 2.0)
         self.assertEqual(args.cuda_conv_algo, "HEURISTIC")
         self.assertTrue(args.onnx_pad_fix)
+        self.assertTrue(args.no_viewer)
 
     def test_jetson_compatibility_options_can_be_overridden(self):
         with patch.object(sys, "argv", ["demo.py", "--orbbec", "--jetson",
-                                        "--cuda-conv-algo", "DEFAULT", "--no-onnx-pad-fix"]):
+                                        "--cuda-conv-algo", "DEFAULT", "--no-onnx-pad-fix",
+                                        "--local-viewer", "--duration", "10", "--max-frames", "20",
+                                        "--rerun-stride", "2"]):
             args = parse_args()
         self.assertEqual(args.cuda_conv_algo, "DEFAULT")
         self.assertFalse(args.onnx_pad_fix)
+        self.assertFalse(args.no_viewer)
+        self.assertEqual(args.duration, 10.0)
+        self.assertEqual(args.max_frames, 20)
+        self.assertEqual(args.rerun_stride, 2)
 
 
 class JetsonEnvironmentTests(unittest.TestCase):

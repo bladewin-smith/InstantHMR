@@ -4,7 +4,7 @@
     python demo.py --image photo.jpg
     python demo.py --video clip.mp4 --pose-filter one-euro
     python demo.py --camera 0 --model small --fit 1 --device tensorrt
-    python demo.py --orbbec --jetson --pose-filter one-euro
+    python demo.py --orbbec --jetson --save-rrd jetson-run.rrd --duration 30
 """
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ def parse_args() -> argparse.Namespace:
     src.add_argument("--camera", type=int, metavar="INDEX", help="live camera, e.g. 0")
     src.add_argument("--orbbec", action="store_true", help="Orbbec Gemini 2 through Orbbec SDK v2")
     p.add_argument("--jetson", action="store_true",
-                   help="8 GB Jetson preset: small/fit1, uncompiled RF-DETR nano, 2 persons, detector stride 2")
+                   help="headless 8 GB Jetson preset: small/fit1, RF-DETR nano, 2 persons, stride 2")
     p.add_argument("--model", default=None,
                    help=f"{', '.join(MODELS)}, or a path to an .onnx file")
     p.add_argument("--fit", type=int, default=None, choices=(0, 1, 2),
@@ -62,7 +62,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-mesh", action="store_true", help="show the skeleton only")
     p.add_argument("--mesh-alpha", type=float, default=0.35, help="mesh opacity (default: 0.35)")
     p.add_argument("--save-rrd", metavar="PATH", help="also save the Rerun recording")
-    p.add_argument("--no-viewer", action="store_true", help="do not open the Rerun viewer")
+    view = p.add_mutually_exclusive_group()
+    view.add_argument("--no-viewer", action="store_true", help="do not open the Rerun viewer")
+    view.add_argument("--local-viewer", action="store_true",
+                      help="open Rerun locally even with --jetson (may exceed the carrier power budget)")
+    p.add_argument("--duration", type=float, metavar="SECONDS",
+                   help="stop after this many seconds of source time")
+    p.add_argument("--max-frames", type=int, help="stop after this many processed frames")
+    p.add_argument("--rerun-stride", type=int, default=1, metavar="N",
+                   help="record/display every Nth frame in Rerun (default: 1)")
     args = p.parse_args()
     if args.jetson:
         args.model = args.model or "small"
@@ -73,6 +81,9 @@ def parse_args() -> argparse.Namespace:
         args.trt_workspace_gb = 2.0 if args.trt_workspace_gb is None else args.trt_workspace_gb
         args.cuda_conv_algo = args.cuda_conv_algo or "HEURISTIC"
         args.onnx_pad_fix = True if args.onnx_pad_fix is None else args.onnx_pad_fix
+        # Local Rerun rendering adds a second GPU/CPU workload.  On power-constrained Orin Nano
+        # carrier boards this can trigger an OC shutdown, so it requires an explicit opt-in.
+        args.no_viewer = not args.local_viewer
     else:
         args.model = args.model or DEFAULT_MODEL
         args.fit = DEFAULT_FIT if args.fit is None else args.fit
@@ -80,8 +91,12 @@ def parse_args() -> argparse.Namespace:
         args.detector = args.detector or "medium"
         args.detector_stride = 1 if args.detector_stride is None else args.detector_stride
         args.onnx_pad_fix = False if args.onnx_pad_fix is None else args.onnx_pad_fix
-    if args.max_persons < 1 or args.detector_stride < 1:
-        p.error("--max-persons and --detector-stride must be at least 1")
+    if args.max_persons < 1 or args.detector_stride < 1 or args.rerun_stride < 1:
+        p.error("--max-persons, --detector-stride and --rerun-stride must be at least 1")
+    if args.max_frames is not None and args.max_frames < 1:
+        p.error("--max-frames must be at least 1")
+    if args.duration is not None and args.duration <= 0:
+        p.error("--duration must be positive")
     if args.focal is not None and args.focal <= 0:
         p.error("--focal must be positive")
     if args.trt_workspace_gb is not None and args.trt_workspace_gb <= 0:
@@ -142,6 +157,8 @@ def main() -> None:
     if args.onnx_pad_fix:
         print(f"Jetson compatibility: asymmetric-padding rewrite enabled; "
               f"cuDNN search={args.cuda_conv_algo or 'ORT default'}")
+    if args.jetson and args.local_viewer:
+        print("WARNING: local Rerun rendering is enabled on Jetson; monitor carrier input power and OC events")
     principal = tuple(args.principal_point) if args.principal_point is not None else None
     workspace = (int(args.trt_workspace_gb * 1024 ** 3) if args.trt_workspace_gb is not None else None)
     pipeline = PosePipeline(args.model, fit=args.fit, device=args.device, detector=args.detector,
@@ -160,14 +177,20 @@ def main() -> None:
     # image/video inputs remain unbounded so their final median still covers the complete file.
     live = args.orbbec or args.camera is not None
     history = deque(maxlen=1800 if live else None)
+    processed, source_start = 0, None
     try:
         for i, t, rgb, focal, principal in frames(args):
+            source_start = t if source_start is None else source_start
+            if ((args.max_frames is not None and processed >= args.max_frames)
+                    or (args.duration is not None and t - source_start >= args.duration)):
+                break
             result = pipeline(rgb, t, focal=focal, principal_point=principal)
             persons = smoother(result.persons, t) if smoother else result.persons
             timings = {"detector": result.detector_ms, "InstantHMR": result.hmr_ms}
-            if viewer is not None:
+            if viewer is not None and processed % args.rerun_stride == 0:
                 viewer.log(i, rgb, persons, timings)
             history.append((result.detector_ms, result.hmr_ms))
+            processed += 1
             if i % 30 == 0:
                 print(f"frame {i:5d}  {len(persons)} person(s)  detector {result.detector_ms:5.1f} ms  "
                       f"InstantHMR {result.hmr_ms:5.1f} ms")

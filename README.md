@@ -124,9 +124,11 @@ sudo apt update
 sudo apt install -y python3-venv python3-pip libopenblas-dev libgl1
 ```
 
-Use an NVMe SSD when possible: model downloads and TensorRT engine caches are much more pleasant
-there than on a small microSD card. Select `MAXN SUPER` in the Jetson power-mode UI and use
-`sudo jetson_clocks` while benchmarking. Keep a fan attached; throttling makes timings misleading.
+Use an NVMe SSD when possible: model downloads, RRD recordings and TensorRT engine caches are much
+more pleasant there than on a small microSD card. Start in a carrier-supported capped power mode;
+check it with `sudo nvpmodel -q`. Do not enable `MAXN SUPER` or `jetson_clocks` until the complete
+camera/inference workload is electrically stable. Use the carrier vendor's specified power supply
+and active cooling.
 
 #### 2. Create the Python environment (verified JetPack 6 device)
 
@@ -258,18 +260,27 @@ form cannot be folded back into the unsupported asymmetric convolution by ORT 1.
 model is never overwritten. It avoids the `CUDNN_FE ... HEURISTIC_QUERY_FAILED` failure seen with
 cuDNN 9.6 on the first FP16 stem convolution; later runs reuse the cached graph.
 
-For the local Rerun UI, omit `--no-viewer`:
+On an Orin Nano, `--jetson` now defaults to headless operation even if `--no-viewer` is omitted.
+Local Rerun rendering adds GPU/CPU/display load on top of inference and may exceed a carrier board's
+instantaneous current budget. Only opt in after validating the power path:
 
 ```bash
-python demo.py --orbbec --jetson --device cuda --pose-filter one-euro
+python demo.py --orbbec --jetson --device cuda --pose-filter one-euro --local-viewer
 ```
 
-For a headless Jetson, save an RRD without spawning the viewer, then copy it to a workstation:
+The recommended workflow is to save an RRD without spawning the viewer, then copy it to a
+workstation. This example records 30 seconds and logs every second processed frame to reduce CPU,
+NVMe and file-size overhead:
 
 ```bash
-python demo.py --orbbec --jetson --device cuda --no-viewer --save-rrd jetson-run.rrd
+python demo.py --orbbec --jetson --device cuda --no-viewer --save-rrd jetson-run.rrd \
+  --duration 30 --rerun-stride 2
 rerun jetson-run.rrd             # run this on the workstation after copying the file
 ```
+
+Omit `--duration` to record until `Ctrl+C`. `--max-frames N` is available when an exact frame count
+is preferable. `--no-viewer --save-rrd` still serializes Rerun data, but it does not create the
+native window or its live renderer.
 
 #### 5. Enable TensorRT
 
@@ -297,7 +308,8 @@ do not install the JetPack 7 ORT 1.32 package or desktop `tensorrt-cu12` over Je
 
 | Goal | Recommended options |
 |---|---|
-| Balanced 8 GB live use | `--jetson` (small, fit1, detector nano, 2 people, stride 2) |
+| Balanced 8 GB live use | `--jetson` (headless; small, fit1, detector nano, 2 people, stride 2) |
+| Low-overhead RRD | `--jetson --save-rrd run.rrd --duration 30 --rerun-stride 2` |
 | Lowest memory/latency | `--jetson --model nano --fit 0 --max-persons 1 --no-mesh --no-viewer` |
 | Better pose quality | `--jetson --model medium --fit 2 --max-persons 1` |
 | Faster detection | raise `--detector-stride` to `3` or `4` |
@@ -352,6 +364,14 @@ faithful InstantHMR reproduction.
 - **Out of memory / process killed:** use `--no-viewer`, `--no-mesh`, `--max-persons 1`, detector
   `nano`, `--fit 0` or `1`, close the Ubuntu desktop/browser, and reduce camera resolution. Swap can
   help CPU allocations but does not create GPU bandwidth.
+- **Carrier overcurrent / board freezes or powers off:** keep the local viewer disabled, do not use
+  `MAXN SUPER` or `jetson_clocks`, select a carrier-supported capped mode with `nvpmodel`, and use
+  the carrier vendor's specified supply and cabling. The [Gemini 2 datasheet](https://www.orbbec.com/staging/wp-content/uploads/2023/04/ORBBEC_Datasheet_Gemini-2.pdf)
+  specifies a peak draw well above its average, so a properly powered USB 3 hub can remove the
+  camera load from a marginal carrier rail. Inspect counters with
+  `grep "" /sys/class/hwmon/hwmon*/oc*_event_cnt` before and after a run. Do not raise the INA3221
+  current limits or modify BPMP throttle points to hide the event; use NVIDIA's
+  [power and OC guidance](https://docs.nvidia.com/jetson/archives/r36.4.3/DeveloperGuide/SD/PlatformPowerAndPerformance/JetsonOrinNanoSeriesJetsonOrinNxSeriesAndJetsonAgxOrinSeries.html).
 - **`CUDNN_FE failure 8: HEURISTIC_QUERY_FAILED` / `No valid engine configs for ConvFwd`:** this is
   the cuDNN 9.6 asymmetric-padding frontend issue, not a bad camera or RF-DETR download. Update the
   repository, install the updated `requirements-jetson.txt` (it adds ONNX 1.17.0), and keep
@@ -392,7 +412,11 @@ detector, then InstantHMR runs on each of them.
 | `--orbbec` | capture Gemini 2 with Orbbec SDK v2, including calibration and hardware timestamps |
 | `--orbbec-serial` | choose one Orbbec device when several are connected |
 | `--orbbec-width`, `--orbbec-height`, `--orbbec-fps` | requested colour profile (1280x720 at 30 fps by default) |
-| `--jetson` | safe Orin Nano 8 GB model/detector/batch/workspace/cuDNN preset; disables RF-DETR compilation and enables the ONNX padding fix |
+| `--jetson` | headless Orin Nano 8 GB model/detector/batch/workspace/cuDNN preset; disables RF-DETR compilation and enables the ONNX padding fix |
+| `--local-viewer` | explicitly allow a local Rerun window with `--jetson`; use only after power validation |
+| `--duration` | stop after N seconds of source time |
+| `--max-frames` | stop after N processed frames |
+| `--rerun-stride` | record/display every Nth processed frame to reduce RRD overhead |
 | `--onnx-pad-fix`, `--no-onnx-pad-fix` | enable/disable the semantics-preserving asymmetric-Conv workaround |
 | `--cuda-conv-algo` | ORT cuDNN search: `EXHAUSTIVE`, `HEURISTIC` or `DEFAULT` (Jetson: `HEURISTIC`) |
 | `--trt-workspace-gb` | TensorRT workspace cap; the Jetson preset uses 2 GiB |
