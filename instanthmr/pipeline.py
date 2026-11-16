@@ -40,18 +40,20 @@ class PosePipeline:
     runs the detector every N frames; in between, each person's box follows its 2D keypoints of the previous
     frame. `pose_filter` ("one-euro" or "alpha-beta") filters each person's pose across frames. Calibration can
     be supplied once here or overridden per frame by `__call__`; `mesh=False` runs in skeleton-only mode.
+    `detector_compile=False` keeps RF-DETR eager for memory-constrained Jetson deployments.
     """
 
     def __init__(self, model: str | Path = DEFAULT_MODEL, fit: int = DEFAULT_FIT, device: str = "cuda",
                  detector: str = "medium", det_confidence: float = 0.5, max_persons: int = 4,
                  detector_stride: int = 1, focal: float | None = None,
                  principal_point: tuple[float, float] | None = None, pose_filter: str | None = None,
-                 mesh: bool = True, trt_workspace_size: int | None = None):
+                 mesh: bool = True, trt_workspace_size: int | None = None,
+                 detector_compile: bool = True):
         self.hmr = InstantHMR(resolve_model(model, fit), device=device, focal=focal,
                               principal_point=principal_point, max_batch=max_persons,
                               pose_filter=PoseFilter(pose_filter) if pose_filter else None,
                               return_mesh=mesh, trt_workspace_size=trt_workspace_size)
-        self.detector = PersonDetector(detector, det_confidence, max_persons)
+        self.detector = PersonDetector(detector, det_confidence, max_persons, compile_model=detector_compile)
         self.detector_stride = max(1, detector_stride)
         self._frame = 0
         self._boxes = np.zeros((0, 4), np.float32)

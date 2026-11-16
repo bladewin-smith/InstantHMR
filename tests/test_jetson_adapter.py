@@ -10,7 +10,9 @@ import numpy as np
 
 from demo import parse_args
 from instanthmr.camera_orbbec import OrbbecGemini2Source, _frame_to_rgb
+from instanthmr.detector import PersonDetector
 from instanthmr.inference import HMRPrediction, InstantHMR
+from tools.check_jetson import classify_stack
 
 
 class _Formats:
@@ -164,6 +166,48 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.max_persons, 2)
         self.assertEqual(args.detector_stride, 2)
         self.assertEqual(args.trt_workspace_gb, 2.0)
+
+
+class JetsonEnvironmentTests(unittest.TestCase):
+    def test_selects_verified_jetpack_6_requirements(self):
+        stack, requirements = classify_stack((3, 10), "12.6")
+        self.assertEqual(stack, "JetPack 6 / CUDA 12")
+        self.assertEqual(requirements, "requirements-jetson.txt")
+
+    def test_selects_jetpack_7_requirements(self):
+        stack, requirements = classify_stack((3, 12), "13.2")
+        self.assertEqual(stack, "JetPack 7 / CUDA 13")
+        self.assertEqual(requirements, "requirements-jetson-jp7.txt")
+
+
+class DetectorCompatibilityTests(unittest.TestCase):
+    def test_new_rfdetr_uses_uncompiled_inference_object(self):
+        predictor = types.SimpleNamespace(predict=lambda *args, **kwargs: None)
+
+        class Model:
+            compile = None
+
+            def inference(self, compile=True):
+                Model.compile = compile
+                return predictor
+
+        fake = types.SimpleNamespace(RFDETRNano=Model)
+        with patch.dict(sys.modules, {"rfdetr": fake}):
+            detector = PersonDetector("nano", compile_model=False)
+        self.assertIs(detector.model, predictor)
+        self.assertFalse(Model.compile)
+
+    def test_legacy_rfdetr_keeps_in_place_model(self):
+        class Model:
+            optimized = False
+
+            def optimize_for_inference(self):
+                self.optimized = True
+
+        fake = types.SimpleNamespace(RFDETRNano=Model)
+        with patch.dict(sys.modules, {"rfdetr": fake}):
+            detector = PersonDetector("nano")
+        self.assertTrue(detector.model.optimized)
 
 
 if __name__ == "__main__":

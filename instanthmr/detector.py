@@ -14,17 +14,29 @@ COCO_PERSON = 1
 class PersonDetector:
     """Returns `(boxes (N, 4) x1 y1 x2 y2, scores (N,))` for the people in an RGB frame, best first."""
 
-    def __init__(self, variant: str = "medium", confidence: float = 0.5, max_persons: int = 4):
+    def __init__(self, variant: str = "medium", confidence: float = 0.5, max_persons: int = 4,
+                 compile_model: bool = True):
         import rfdetr
 
         logging.getLogger("rf-detr").setLevel(logging.ERROR)
         if variant not in VARIANTS:
             raise ValueError(f"unknown RF-DETR variant {variant!r}: choose one of {', '.join(VARIANTS)}")
-        self.model = getattr(rfdetr, VARIANTS[variant])()
-        if hasattr(self.model, "optimize_for_inference"):   # rfdetr < 1.10
+        model = getattr(rfdetr, VARIANTS[variant])()
+        if hasattr(model, "inference"):
+            # RF-DETR 1.9+ exposes a prediction-only path. The Jetson preset passes
+            # compile_model=False: CUDA-graph/Inductor setup reserves another memory pool and
+            # NVIDIA's JetPack torch is not the upstream wheel those backends are tested against.
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                self.model.optimize_for_inference()
+                predictor = model.inference(compile=compile_model)
+            self.model = predictor if predictor is not None else model
+        elif hasattr(model, "optimize_for_inference"):     # legacy RF-DETR
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                predictor = model.optimize_for_inference()
+            self.model = predictor if predictor is not None else model
+        else:
+            self.model = model
         self.confidence, self.max_persons = confidence, max_persons
 
     def __call__(self, image_rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray]:

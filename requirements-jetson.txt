@@ -1,6 +1,12 @@
-# Jetson Orin / JetPack 7.2 (Ubuntu 24.04, CUDA 13) additions.
-# Install a CUDA-enabled ARM64 torch/torchvision first; rfdetr in requirements.txt uses them.
+# Verified deployment: Jetson Orin / JetPack 6, Python 3.10, CUDA 12.6, cuDNN 9.6.
+# Create the environment with --system-site-packages so pip reuses NVIDIA's torch,
+# torchvision, ONNX Runtime and TensorRT packages. Do not install this into a clean venv.
 -r requirements.txt
 
-pyorbbecsdk2>=2.1,<3
-onnxruntime-gpu==1.32.* ; platform_system == "Linux" and platform_machine == "aarch64"
+# Keep the ABI-compatible versions already verified on the target. The exact pins also stop
+# transitive dependencies from replacing JetPack's NumPy/OpenCV or the custom ARM64 ORT wheel.
+numpy==1.26.4
+opencv-python==4.10.0.84
+rfdetr==1.12.1
+pyorbbecsdk2==2.1.1
+onnxruntime-gpu==1.20.0 ; platform_system == "Linux" and platform_machine == "aarch64" and python_version < "3.11"

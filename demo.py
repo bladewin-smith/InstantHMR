@@ -29,7 +29,7 @@ def parse_args() -> argparse.Namespace:
     src.add_argument("--camera", type=int, metavar="INDEX", help="live camera, e.g. 0")
     src.add_argument("--orbbec", action="store_true", help="Orbbec Gemini 2 through Orbbec SDK v2")
     p.add_argument("--jetson", action="store_true",
-                   help="8 GB Jetson preset: small/fit1, RF-DETR nano, 2 persons, detector stride 2")
+                   help="8 GB Jetson preset: small/fit1, uncompiled RF-DETR nano, 2 persons, detector stride 2")
     p.add_argument("--model", default=None,
                    help=f"{', '.join(MODELS)}, or a path to an .onnx file")
     p.add_argument("--fit", type=int, default=None, choices=(0, 1, 2),
@@ -137,7 +137,8 @@ def main() -> None:
     pipeline = PosePipeline(args.model, fit=args.fit, device=args.device, detector=args.detector,
                             det_confidence=args.det_confidence, max_persons=args.max_persons,
                             detector_stride=args.detector_stride, focal=args.focal, principal_point=principal,
-                            pose_filter=args.pose_filter, mesh=not args.no_mesh, trt_workspace_size=workspace)
+                            pose_filter=args.pose_filter, mesh=not args.no_mesh, trt_workspace_size=workspace,
+                            detector_compile=not args.jetson)
     print(f"InstantHMR runs on {pipeline.hmr.provider}")
     viewer = (RerunVisualizer(pipeline.hmr.faces, args.mesh_alpha, spawn=not args.no_viewer,
                               save_path=args.save_rrd)

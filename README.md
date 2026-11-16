@@ -95,55 +95,73 @@ The Jetson path is an inference deployment: the live demo, 2D/3D keypoints and f
 supported. Training the released models is not practical in the Orin Nano's 8 GB of shared memory;
 train on a workstation/server and deploy the exported ONNX files here.
 
-The supported reference environment for this guide is:
+The primary environment is the stack verified on the target device:
 
-- Jetson Orin Nano 8 GB with adequate active cooling and USB 3;
-- [JetPack 7.2.1](https://developer.nvidia.com/embedded/jetpack/downloads) / Ubuntu 24.04 /
-  Python 3.12 / CUDA 13.2 / TensorRT 10.16;
-- Orbbec Gemini 2 with Orbbec SDK v2 and firmware 1.4.92 or newer (Orbbec recommends 1.4.98;
-  do not downgrade a newer working firmware).
+- Jetson Orin Nano 8 GB, Linux 5.15 Tegra / glibc 2.35, Python 3.10.12;
+- CUDA 12.6, cuDNN 9.6, NVIDIA PyTorch 2.5.0a0 (24.08) and torchvision 0.20.0a0;
+- ONNX Runtime GPU 1.20.0 with TensorRT, CUDA and CPU providers, and TensorRT 10.7.0;
+- `pyorbbecsdk2` wrapper 2.1.1 / Orbbec SDK runtime 2.8.6;
+- Gemini 2 firmware 1.4.98, verified at RGB 1280x720 at 30 fps over USB 3.
 
-JetPack 6 uses CUDA 12 and needs a different Jetson-specific ONNX Runtime build. Do not install the
-JetPack 7 requirements below on JetPack 6. Check the installed release first:
+This is a JetPack 6 / Ubuntu 22.04-generation environment. JetPack 7 uses Python 3.12 and CUDA 13,
+so it has a separate `requirements-jetson-jp7.txt`. Never install the JetPack 7 ORT 1.32 wheel on
+this CUDA 12.6 device. Identify the stack before installing anything:
 
 ```bash
 uname -m                         # must print aarch64
 cat /etc/nv_tegra_release
-python3 --version                # 3.12 on the reference image
+python3 --version                # 3.10.12 on the verified JetPack 6 device
 ```
 
 #### 1. Install the JetPack components and system prerequisites
 
-Install JetPack 7.2.1 using NVIDIA's current Orin Nano ISO/SDK Manager instructions, boot it, then:
+Do not replace an already working JetPack CUDA, cuDNN, TensorRT, PyTorch or ONNX Runtime package.
+Only install the missing OS utilities:
 
 ```bash
 sudo apt update
-sudo apt install -y nvidia-jetpack python3-venv python3-pip libopenblas-dev libgl1
-sudo reboot
+sudo apt install -y python3-venv python3-pip libopenblas-dev libgl1
 ```
 
 Use an NVMe SSD when possible: model downloads and TensorRT engine caches are much more pleasant
 there than on a small microSD card. Select `MAXN SUPER` in the Jetson power-mode UI and use
 `sudo jetson_clocks` while benchmarking. Keep a fan attached; throttling makes timings misleading.
 
-#### 2. Create the Python environment
+#### 2. Create the Python environment (verified JetPack 6 device)
 
-JetPack 7 provides the CUDA/TensorRT system stack. Install a CUDA-enabled ARM64 PyTorch before
-RF-DETR, then the Jetson-specific requirements:
+The NVIDIA builds are already installed in the system interpreter. Use `--system-site-packages` to
+reuse them while keeping this project's new Python packages out of the ROS/JetPack system
+environment:
 
 ```bash
 git clone https://github.com/Naturalpad-studio/InstantHMR.git
 cd InstantHMR
-python3 -m venv .venv
-source .venv/bin/activate
+python3 -m venv --system-site-packages .venv-jp6
+source .venv-jp6/bin/activate
 python -m pip install --upgrade pip
-python -m pip install torch torchvision
 python -m pip install -r requirements-jetson.txt
 ```
 
-This deliberately uses `onnxruntime-gpu 1.32` for its CUDA 13 / Linux ARM64 wheel. The desktop
-`onnxruntime-gpu[cuda,cudnn]==1.26.*` dependency has no aarch64 wheel and must not be used on this
-Jetson. Likewise, do not install `tensorrt-cu12`: JetPack already owns the TensorRT 10.16 libraries.
+The JetPack 6 file pins the versions verified on the device: NumPy 1.26.4, OpenCV 4.10,
+RF-DETR 1.12.1, `pyorbbecsdk2` 2.1.1 and ORT 1.20.0. The ORT requirement is satisfied by the
+system-visible custom ARM64 installation; pip must not replace it. Do not run `pip install torch`,
+`torchvision`, `onnxruntime-gpu`, `tensorrt` or `numpy --upgrade` separately.
+
+The base system currently contains unrelated `pip check` conflicts from airo (which requests NumPy
+2) and old TensorFlow companion packages. They are not InstantHMR dependencies. Keep NumPy 1.26.4
+for this ROS/JetPack environment rather than breaking OpenCV, cv_bridge or the NVIDIA stack to make
+those unrelated packages agree.
+
+For a real JetPack 7 / CUDA 13 device, create a normal venv and use the separate file instead:
+
+```bash
+python3 -m venv .venv-jp7
+source .venv-jp7/bin/activate
+python -m pip install --upgrade pip
+# Install the JetPack 7 CUDA-enabled ARM64 torch/torchvision build first.
+python -m pip install torch torchvision
+python -m pip install -r requirements-jetson-jp7.txt
+```
 
 Verify the accelerator stack before connecting the camera:
 
@@ -151,10 +169,11 @@ Verify the accelerator stack before connecting the camera:
 python tools/check_jetson.py
 ```
 
-The required result is `CUDA available=True` and a `CUDAExecutionProvider`. A
-`TensorrtExecutionProvider` is optional for the first run: `--device cuda` works without it. If
-PyTorch reports CUDA false, replace it with a JetPack-compatible ARM64 build before continuing; a
-CPU-only PyTorch makes RF-DETR unusably slow.
+On the verified device the required lines are CUDA 12.6, cuDNN 90600, ORT 1.20.0 with
+`TensorrtExecutionProvider` and `CUDAExecutionProvider`, and `stack: JetPack 6 / CUDA 12`. The check
+also verifies a real CUDA allocation, torchvision, RF-DETR, NumPy/OpenCV and distinguishes the
+Orbbec Python-wrapper version from its bundled SDK runtime. A missing Rerun install is only allowed
+with `--no-viewer` and without `--save-rrd`.
 
 #### 3. Configure and verify Gemini 2
 
@@ -221,37 +240,16 @@ Only after CUDA works, check that `TensorrtExecutionProvider` appears in
 python demo.py --orbbec --jetson --device tensorrt --pose-filter one-euro
 ```
 
-The first run builds engines locally and can take several minutes. Never copy an RTX desktop engine
-cache to Jetson. Rebuild `models/trt_cache/` after changing JetPack, TensorRT, ONNX Runtime, model,
-fit mode or maximum-person count. If the TensorRT provider is missing, stay on `--device cuda` until
-a matching ONNX Runtime TensorRT build is installed; installing desktop `tensorrt-cu12` is not a
-valid fix on JetPack 7.
+The verified JetPack 6 device already exposes both TensorRT and CUDA EPs, so do not rebuild or
+upgrade ORT pre-emptively. Provider discovery proves that the plugin loads; the first actual model
+run is the final compatibility test for ORT 1.20.0 with the installed TensorRT 10.7 runtime. Start
+with CUDA, then try TensorRT. If engine creation fails, keep using `--device cuda` and preserve the
+working packages while diagnosing the log.
 
-The PyPI ARM64 wheel is sufficient for CUDA, but the providers compiled into a wheel can change.
-If the check reports CUDA but no TensorRT and you specifically need TensorRT, build the same ORT
-release on the Jetson against JetPack's libraries (allow roughly 15 GB of free disk space):
-
-```bash
-sudo apt install -y --no-install-recommends build-essential cmake git \
-  libopenblas-dev python3-dev python3-setuptools python3-wheel
-cd ..
-git clone --recursive --branch v1.32.0 --depth 1 https://github.com/microsoft/onnxruntime.git
-cd onnxruntime
-export CUDACXX=/usr/local/cuda/bin/nvcc
-./build.sh --config Release --update --build --parallel 1 --build_wheel --skip_tests \
-  --use_tensorrt --cuda_home /usr/local/cuda \
-  --cudnn_home /usr/lib/aarch64-linux-gnu \
-  --tensorrt_home /usr/lib/aarch64-linux-gnu \
-  --cmake_extra_defines CMAKE_CUDA_ARCHITECTURES=native \
-    onnxruntime_BUILD_UNIT_TESTS=OFF onnxruntime_USE_FLASH_ATTENTION=OFF \
-    onnxruntime_USE_MEMORY_EFFICIENT_ATTENTION=OFF
-python -m pip install --no-deps --force-reinstall build/Linux/Release/dist/onnxruntime_gpu-1.32.0-*.whl
-cd ../InstantHMR
-python tools/check_jetson.py
-```
-
-`--parallel 1` is intentional on the 8 GB board. Do not remove the existing wheel until this build
-succeeds; CUDA mode is the recovery path if the TensorRT build fails.
+The first TensorRT run builds engines locally and can take several minutes. Never copy an RTX
+desktop engine cache to Jetson. Rebuild `models/trt_cache/` after changing JetPack, TensorRT, ONNX
+Runtime, model, fit mode or maximum-person count. A JetPack 6 repair must target its CUDA 12 stack;
+do not install the JetPack 7 ORT 1.32 package or desktop `tensorrt-cu12` over JetPack.
 
 #### Resource/quality presets
 
@@ -266,7 +264,9 @@ succeeds; CUDA mode is the recovery path if the TensorRT build fails.
 `--no-viewer` now skips Rerun initialization and per-frame serialization unless `--save-rrd` is
 also present. `--no-mesh` now also skips the 18,439-vertex MHR body output instead of merely hiding
 it. Live sources retain only the latest 1,800 timing samples rather than growing an unbounded list.
-These are useful recovery options if the process is killed under memory pressure.
+RF-DETR 1.12 uses its prediction-only object with compilation disabled on Jetson, avoiding a second
+CUDA-graph/Inductor memory pool on the 8 GB device. These are useful recovery options if the process
+is killed under memory pressure.
 
 Gemini 2 is an RGB-D camera, but InstantHMR is trained as a monocular RGB model. This adapter does
 not replace `cam_trans` with a depth-box median: that measures the visible clothing surface rather
@@ -281,10 +281,16 @@ faithful InstantHMR reproduction.
 - **Requested RGB profile falls back:** update Gemini 2 firmware/SDK, or specify a supported
   `--orbbec-width`, `--orbbec-height` and `--orbbec-fps`. The fallback is valid but MJPEG may use
   more CPU.
-- **`CUDAExecutionProvider` missing:** the desktop ORT wheel or a CPU build was installed. Recreate
-  the environment with `requirements-jetson.txt` and verify JetPack 7/Python 3.12/aarch64.
+- **`CUDAExecutionProvider` missing:** the custom Jetson ORT was hidden or replaced. On the verified
+  Python 3.10/CUDA 12 device recreate a `--system-site-packages` venv with
+  `requirements-jetson.txt`; use `requirements-jetson-jp7.txt` only on Python 3.12/CUDA 13.
 - **`TensorrtExecutionProvider` missing:** use `--device cuda`; TensorRT acceleration is optional,
   and the installed ORT wheel must match JetPack's CUDA/TensorRT ABI.
+- **`RF-DETR is not installed`:** activate `.venv-jp6` and rerun
+  `python -m pip install -r requirements-jetson.txt`; do not install a replacement torch wheel.
+- **Global `pip check` reports airo/TensorFlow conflicts:** these are pre-existing packages outside
+  InstantHMR. Do not upgrade NumPy to 2 or downgrade the NVIDIA TensorFlow stack for this project;
+  use the project venv and validate with `tools/check_jetson.py`.
 - **Out of memory / process killed:** use `--no-viewer`, `--no-mesh`, `--max-persons 1`, detector
   `nano`, `--fit 0` or `1`, close the Ubuntu desktop/browser, and reduce camera resolution. Swap can
   help CPU allocations but does not create GPU bandwidth.
@@ -318,7 +324,7 @@ detector, then InstantHMR runs on each of them.
 | `--orbbec` | capture Gemini 2 with Orbbec SDK v2, including calibration and hardware timestamps |
 | `--orbbec-serial` | choose one Orbbec device when several are connected |
 | `--orbbec-width`, `--orbbec-height`, `--orbbec-fps` | requested colour profile (1280x720 at 30 fps by default) |
-| `--jetson` | safe Orin Nano 8 GB model/detector/batch/workspace preset |
+| `--jetson` | safe Orin Nano 8 GB model/detector/batch/workspace preset; disables RF-DETR compilation |
 | `--trt-workspace-gb` | TensorRT workspace cap; the Jetson preset uses 2 GiB |
 | `--detector` | RF-DETR size: `nano`, `small`, `medium` (default), `base`, `large` |
 | `--max-persons` | most people per frame (default 4) |
