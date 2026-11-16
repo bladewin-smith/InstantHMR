@@ -3,5 +3,5 @@ opencv-python
 huggingface_hub
 rerun-sdk==0.31.*
 rfdetr>=1.6
-onnxruntime-gpu[cuda,cudnn]==1.26.* ; platform_system != "Darwin"
+onnxruntime-gpu[cuda,cudnn]==1.26.* ; platform_system != "Darwin" and platform_machine != "aarch64"
 onnxruntime==1.26.* ; platform_system == "Darwin"

@@ -54,7 +54,8 @@ class RerunVisualizer:
         if persons:
             depth = float(np.median([p.cam_trans[2] for p in persons]))
             rr.log("camera", rr.Pinhole(width=w, height=h, focal_length=persons[0].focal_length,
-                                        principal_point=[w / 2, h / 2], image_plane_distance=max(0.25 * depth, 0.2)))
+                                        principal_point=persons[0].principal_point,
+                                        image_plane_distance=max(0.25 * depth, 0.2)))
             if not self._layout_sent:
                 self._send_layout(persons[0])
                 self._layout_sent = True

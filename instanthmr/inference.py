@@ -34,37 +34,37 @@ class HMRPrediction:
     cam_trans: np.ndarray               # (3,)
     mhr_params: np.ndarray              # (204,) MHR model parameters
     shape_params: np.ndarray            # (45,) MHR identity coefficients
-    focal_length: float                 # pixels, the camera the 3D is expressed in
+    focal_length: float                 # effective focal in pixels used by the model
+    principal_point: tuple[float, float] # (cx, cy) in pixels
     image_shape: tuple[int, int]        # (H, W)
-    vertices_local: np.ndarray          # (18439, 3)
+    vertices_local: np.ndarray | None   # (18439, 3), or None in skeleton-only mode
 
     @property
     def joints_3d_cam(self) -> np.ndarray:
         return self.joints_3d_local + self.cam_trans
 
     @property
-    def vertices_cam(self) -> np.ndarray:
-        return self.vertices_local + self.cam_trans
+    def vertices_cam(self) -> np.ndarray | None:
+        return None if self.vertices_local is None else self.vertices_local + self.cam_trans
 
 
 def providers_for(device: str, max_batch: int = 1, image_size: int = 288,
-                  cache_dir: str | Path = "models/trt_cache") -> list:
+                  cache_dir: str | Path = "models/trt_cache", trt_workspace_size: int | None = None) -> list:
     """onnxruntime execution providers for a device name, always ending on the CPU."""
     import onnxruntime as ort
 
     available = set(ort.get_available_providers())
     if device == "tensorrt":
-        try:
-            import tensorrt_libs  # noqa: F401  (loads libnvinfer for onnxruntime)
-        except ImportError as e:
-            raise RuntimeError("TensorRT is not installed: pip install tensorrt-cu12==10.15.*") from e
         if "TensorrtExecutionProvider" not in available:
-            raise RuntimeError("this onnxruntime build has no TensorRT support: install onnxruntime-gpu")
+            raise RuntimeError("this onnxruntime build has no TensorRTExecutionProvider; install a JetPack-"
+                               "compatible onnxruntime-gpu build (or use --device cuda)")
         Path(cache_dir).mkdir(parents=True, exist_ok=True)
         shape = lambda n: f"image:{n}x3x{image_size}x{image_size},cliff_cond:{n}x3"  # noqa: E731
         trt = {"trt_fp16_enable": True, "trt_engine_cache_enable": True, "trt_engine_cache_path": str(cache_dir),
                "trt_timing_cache_enable": True, "trt_profile_min_shapes": shape(1),
                "trt_profile_opt_shapes": shape(max_batch), "trt_profile_max_shapes": shape(max_batch)}
+        if trt_workspace_size is not None:
+            trt["trt_max_workspace_size"] = int(trt_workspace_size)
         return [("TensorrtExecutionProvider", trt), "CUDAExecutionProvider", "CPUExecutionProvider"]
     if device == "cuda":
         if "CUDAExecutionProvider" not in available:
@@ -82,12 +82,15 @@ class InstantHMR:
     (`instanthmr-<size>-fit<1|2>.onnx`, read from its metadata), which refines the pose on 1 or 2 crops per
     person. `device` runs it ("cuda", "tensorrt", "cpu" or "coreml"); the body graph runs on CUDA when the
     graph does, else on the CPU. `focal` is the camera focal length in pixels when it is known; otherwise
-    1.05 x the image diagonal is assumed. `max_batch` is the most people predicted in one call. `pose_filter`
-    (smoothing.PoseFilter) filters each person's pose across frames before the mesh is built.
+    1.05 x the image diagonal is assumed. `principal_point` defaults to the image centre. `max_batch` is the
+    most people predicted in one call. `pose_filter` (smoothing.PoseFilter) filters each person's pose across
+    frames before the mesh is built. `return_mesh=False` skips the full vertex output.
     """
 
     def __init__(self, model_path: str | Path, body_path: str | Path | None = None, device: str = "cuda",
-                 focal: float | None = None, max_batch: int = 4, pose_filter=None):
+                 focal: float | None = None, principal_point: tuple[float, float] | None = None,
+                 max_batch: int = 4, pose_filter=None, return_mesh: bool = True,
+                 trt_workspace_size: int | None = None):
         import onnxruntime as ort
 
         from .models import resolve_body
@@ -109,14 +112,16 @@ class InstantHMR:
         self.scales = tuple(float(v) for v in meta["crop_scales"].split(",")) if self.n_crops else (1.0,)
         del probe
         if self.n_crops:
-            providers = _fit_providers(device, Path(model_path).stem)
+            providers = _fit_providers(device, Path(model_path).stem, trt_workspace_size=trt_workspace_size)
         else:
-            providers = providers_for(device, max_batch, self.input_size)
+            providers = providers_for(device, max_batch, self.input_size, trt_workspace_size=trt_workspace_size)
         self.network = ort.InferenceSession(str(model_path), sess_options=options, providers=providers)
         self.provider = self.network.get_providers()[0]
         self.focal = focal
+        self.principal_point = principal_point
         self.max_batch = max_batch
         self.pose_filter = pose_filter
+        self.return_mesh = return_mesh
         self._binding = None
         if self.n_crops and self.provider == "CUDAExecutionProvider":
             self._bind_cuda_graph(ort)
@@ -124,8 +129,8 @@ class InstantHMR:
         body_path = Path(body_path) if body_path else resolve_body(Path(model_path))
         self.body = ort.InferenceSession(str(body_path), sess_options=options,
                                          providers=providers_for("cuda" if device in ("cuda", "tensorrt") else "cpu"))
-        self.faces = np.frombuffer(base64.b64decode(self.body.get_modelmeta().custom_metadata_map["mesh_faces"]),
-                                   "<i4").reshape(-1, 3)
+        self.faces = (np.frombuffer(base64.b64decode(self.body.get_modelmeta().custom_metadata_map["mesh_faces"]),
+                                    "<i4").reshape(-1, 3) if return_mesh else None)
 
     def focal_px(self, h: int, w: int, focal: float | None = None) -> float:
         f = focal if focal is not None else self.focal
@@ -134,30 +139,37 @@ class InstantHMR:
         return (FOCAL_FALLBACK_DIAG if self.cliff_focal else 1.0) * math.hypot(h, w)
 
     def predict(self, image_rgb: np.ndarray, bboxes: Sequence, confidences: Sequence[float] | None = None,
-                focal: float | None = None, timestamp: float | None = None) -> list[HMRPrediction]:
+                focal: float | None = None, principal_point: tuple[float, float] | None = None,
+                timestamp: float | None = None) -> list[HMRPrediction]:
         """All people of one frame. `bboxes` are tight person boxes (as a detector gives them), x1 y1 x2 y2;
-        `timestamp` (seconds) is only read by the pose filter."""
+        per-frame `focal` and `principal_point` override the constructor calibration. `timestamp` (seconds) is
+        only read by the pose filter."""
         if len(bboxes) == 0:
             return []
         h, w = image_rgb.shape[:2]
         f = self.focal_px(h, w, focal)
+        pp = principal_point if principal_point is not None else self.principal_point
+        pp = (float(pp[0]), float(pp[1])) if pp is not None else (w / 2.0, h / 2.0)
         boxes = [np.asarray(b, np.float32) for b in bboxes]
-        outs = self._estimate_fit(image_rgb, boxes, f) if self.n_crops else self._estimate(image_rgb, boxes, f)
+        outs = self._estimate_fit(image_rgb, boxes, f, pp) if self.n_crops else self._estimate(image_rgb, boxes, f, pp)
         if self.pose_filter is not None:
             outs["mhr_params"] = self.pose_filter(boxes, outs["mhr_params"], timestamp)
-        joints_3d, vertices = self.body.run(["joints_3d", "vertices"], {"mhr_params": outs["mhr_params"],
-                                                                        "shape_params": outs["shape_params"]})
+        body_names = ["joints_3d", "vertices"] if self.return_mesh else ["joints_3d"]
+        body_out = self.body.run(body_names, {"mhr_params": outs["mhr_params"],
+                                              "shape_params": outs["shape_params"]})
+        joints_3d = body_out[0]
+        vertices = body_out[1] if self.return_mesh else [None] * len(boxes)
         confidences = confidences if confidences is not None else [1.0] * len(boxes)
         return [HMRPrediction(bbox=boxes[i], confidence=float(confidences[i]), joints_2d=outs["joints_2d"][i],
                               joints_3d_local=joints_3d[i], cam_trans=outs["cam_trans"][i],
                               mhr_params=outs["mhr_params"][i], shape_params=outs["shape_params"][i],
-                              focal_length=f, image_shape=(h, w), vertices_local=vertices[i])
+                              focal_length=f, principal_point=pp, image_shape=(h, w), vertices_local=vertices[i])
                 for i in range(len(boxes))]
 
-    def _estimate(self, image_rgb, boxes, f) -> dict[str, np.ndarray]:
+    def _estimate(self, image_rgb, boxes, f, principal_point) -> dict[str, np.ndarray]:
         """The network graph: one crop per person, batches of up to `max_batch`; 2D in pixels."""
         names = ["mhr_params", "shape_params", "cam_trans", "joints_2d"]
-        crops, cliffs, squares = zip(*(self._crop(image_rgb, b, 1.0, f) for b in boxes))
+        crops, cliffs, squares = zip(*(self._crop(image_rgb, b, 1.0, f, principal_point) for b in boxes))
         crops = np.stack([_normalise(c) for c in crops])
         cliffs = np.stack(cliffs)
         chunks = [self.network.run(names, {"image": crops[i:i + self.max_batch], "cliff_cond": cliffs[i:i + self.max_batch]})
@@ -167,15 +179,14 @@ class InstantHMR:
         outs["joints_2d"] = (outs["joints_2d"] + 1.0) * 0.5 * sq[:, None, 2:] + sq[:, None, :2]
         return outs
 
-    def _estimate_fit(self, image_rgb, boxes, f) -> dict[str, np.ndarray]:
+    def _estimate_fit(self, image_rgb, boxes, f, principal_point) -> dict[str, np.ndarray]:
         """The network + fit graph: one call per person on its 1 or 2 crops; 2D in pixels."""
-        h, w = image_rgb.shape[:2]
-        cam = np.array([[f, w / 2.0, h / 2.0]], np.float32)
+        cam = np.array([[f, principal_point[0], principal_point[1]]], np.float32)
         per_person = []
         for b in boxes:
             c, half = (b[:2] + b[2:]) / 2, (b[2:] - b[:2]) * DETECTOR_TO_GT_BOX / 2
             gt_box = np.concatenate([c - half, c + half])
-            crops, cliffs, squares = zip(*(self._crop(image_rgb, gt_box, s, f) for s in self.scales))
+            crops, cliffs, squares = zip(*(self._crop(image_rgb, gt_box, s, f, principal_point) for s in self.scales))
             per_person.append(self._run_fit({"image": np.stack(crops), "cliff_cond": np.stack(cliffs),
                                              "crop_box": np.asarray(squares, np.float32), "cam": cam}))
         return {k: np.concatenate([o[k] for o in per_person]) for k in per_person[0]}
@@ -210,14 +221,16 @@ class InstantHMR:
         finally:
             self.pose_filter = pose_filter
 
-    def _crop(self, image_rgb: np.ndarray, bbox: np.ndarray, scale: float, focal: float):
+    def _crop(self, image_rgb: np.ndarray, bbox: np.ndarray, scale: float, focal: float,
+              principal_point: tuple[float, float]):
         """The square 1.2x crop of the box scaled by `scale` about its centre, as uint8, cut and resized by one
         affine warp (the same sampling as cropping then resizing); its CLIFF vector and pixel square."""
         h, w = image_rgb.shape[:2]
         x1, y1, x2, y2 = bbox.astype(np.float64)
         cx, cy, size = (x1 + x2) / 2, (y1 + y2) / 2, max(x2 - x1, y2 - y1) * scale
         if self.cliff_focal:
-            cliff = [math.atan((cx - w / 2) / focal), math.atan((cy - h / 2) / focal), size / focal]
+            cliff = [math.atan((cx - principal_point[0]) / focal),
+                     math.atan((cy - principal_point[1]) / focal), size / focal]
         else:
             cliff = [2 * cx / w - 1, 2 * cy / h - 1, size / max(w, h)]
         side = size * CROP_EXPAND
@@ -236,15 +249,19 @@ def _normalise(crop: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(((crop.astype(np.float32) / 255.0 - IMAGENET_MEAN) / IMAGENET_STD).transpose(2, 0, 1))
 
 
-def _fit_providers(device: str, name: str, cache_dir: str | Path = "models/trt_cache") -> list:
+def _fit_providers(device: str, name: str, cache_dir: str | Path = "models/trt_cache",
+                   trt_workspace_size: int | None = None) -> list:
     """Providers for a fit graph (fixed shapes): TensorRT in fp16 with a cached engine, or ORT CUDA with CUDA graphs."""
     if device == "tensorrt":
-        providers = providers_for(device)                 # checks the installation
+        providers = providers_for(device, trt_workspace_size=trt_workspace_size)  # checks the installation
         cache = Path(cache_dir) / name
         cache.mkdir(parents=True, exist_ok=True)
-        return [("TensorrtExecutionProvider", {"trt_fp16_enable": True, "trt_engine_cache_enable": True,
-                                               "trt_engine_cache_path": str(cache), "trt_timing_cache_enable": True,
-                                               "trt_timing_cache_path": str(cache)}), *providers[1:]]
+        options = {"trt_fp16_enable": True, "trt_engine_cache_enable": True,
+                   "trt_engine_cache_path": str(cache), "trt_timing_cache_enable": True,
+                   "trt_timing_cache_path": str(cache)}
+        if trt_workspace_size is not None:
+            options["trt_max_workspace_size"] = int(trt_workspace_size)
+        return [("TensorrtExecutionProvider", options), *providers[1:]]
     if device == "cuda":
         providers_for(device)
         return [("CUDAExecutionProvider", {"enable_cuda_graph": "1"}), "CPUExecutionProvider"]

@@ -38,14 +38,19 @@ class PosePipeline:
     `model` is a released model name (nano, tiny, small, medium, medium-commercial) or an .onnx path; `fit` picks
     the network + kinematic-fit graph on 1 or 2 crops per person (0: the network alone). `detector_stride` > 1
     runs the detector every N frames; in between, each person's box follows its 2D keypoints of the previous
-    frame. `pose_filter` ("one-euro" or "alpha-beta") filters each person's pose across frames.
+    frame. `pose_filter` ("one-euro" or "alpha-beta") filters each person's pose across frames. Calibration can
+    be supplied once here or overridden per frame by `__call__`; `mesh=False` runs in skeleton-only mode.
     """
 
     def __init__(self, model: str | Path = DEFAULT_MODEL, fit: int = DEFAULT_FIT, device: str = "cuda",
                  detector: str = "medium", det_confidence: float = 0.5, max_persons: int = 4,
-                 detector_stride: int = 1, focal: float | None = None, pose_filter: str | None = None):
-        self.hmr = InstantHMR(resolve_model(model, fit), device=device, focal=focal, max_batch=max_persons,
-                              pose_filter=PoseFilter(pose_filter) if pose_filter else None)
+                 detector_stride: int = 1, focal: float | None = None,
+                 principal_point: tuple[float, float] | None = None, pose_filter: str | None = None,
+                 mesh: bool = True, trt_workspace_size: int | None = None):
+        self.hmr = InstantHMR(resolve_model(model, fit), device=device, focal=focal,
+                              principal_point=principal_point, max_batch=max_persons,
+                              pose_filter=PoseFilter(pose_filter) if pose_filter else None,
+                              return_mesh=mesh, trt_workspace_size=trt_workspace_size)
         self.detector = PersonDetector(detector, det_confidence, max_persons)
         self.detector_stride = max(1, detector_stride)
         self._frame = 0
@@ -54,12 +59,14 @@ class PosePipeline:
         self.detector(np.zeros((288, 288, 3), np.uint8))
         self.hmr.warmup(max_persons)
 
-    def __call__(self, image_rgb: np.ndarray, timestamp: float | None = None) -> FrameResult:
+    def __call__(self, image_rgb: np.ndarray, timestamp: float | None = None, focal: float | None = None,
+                 principal_point: tuple[float, float] | None = None) -> FrameResult:
         t0 = time.perf_counter()
         if self._frame % self.detector_stride == 0:
             self._boxes, self._scores = self.detector(image_rgb)
         t1 = time.perf_counter()
-        persons = self.hmr.predict(image_rgb, self._boxes, self._scores, timestamp=timestamp)
+        persons = self.hmr.predict(image_rgb, self._boxes, self._scores, focal=focal,
+                                   principal_point=principal_point, timestamp=timestamp)
         t2 = time.perf_counter()
         h, w = image_rgb.shape[:2]
         self._boxes = np.array([keypoint_box(p.joints_2d, w, h) for p in persons], np.float32).reshape(-1, 4)

@@ -14,6 +14,9 @@ and 3D, and a full body mesh in the [Momentum Human Rig](https://github.com/face
 
 ## News
 
+- **[2026-11-16] Jetson/Orbbec:** native Gemini 2 capture with colour intrinsics and hardware
+  timestamps, an Orin Nano 8 GB preset, ARM64 dependencies, headless execution and a deployment
+  guide.
 - **[2026-11-10]** PyTorch checkpoints of the five models, with their `run_config.json`, on
   [Hugging Face](https://huggingface.co/momolesang/InstantHMR/tree/main/pytorch), to fine-tune them
   on your own data. See [Fine-tuning a released model](training/README.md#fine-tuning-a-released-model).
@@ -86,12 +89,217 @@ The first `pip` line installs PyTorch for CUDA 12, which the person detector use
 shares, so a single set of CUDA libraries is installed. On a Mac, or without an NVIDIA GPU, skip
 it.
 
+### NVIDIA Jetson Orin Nano 8 GB + Orbbec Gemini 2
+
+The Jetson path is an inference deployment: the live demo, 2D/3D keypoints and full MHR mesh are
+supported. Training the released models is not practical in the Orin Nano's 8 GB of shared memory;
+train on a workstation/server and deploy the exported ONNX files here.
+
+The supported reference environment for this guide is:
+
+- Jetson Orin Nano 8 GB with adequate active cooling and USB 3;
+- [JetPack 7.2.1](https://developer.nvidia.com/embedded/jetpack/downloads) / Ubuntu 24.04 /
+  Python 3.12 / CUDA 13.2 / TensorRT 10.16;
+- Orbbec Gemini 2 with Orbbec SDK v2 and firmware 1.4.92 or newer (Orbbec recommends 1.4.98;
+  do not downgrade a newer working firmware).
+
+JetPack 6 uses CUDA 12 and needs a different Jetson-specific ONNX Runtime build. Do not install the
+JetPack 7 requirements below on JetPack 6. Check the installed release first:
+
+```bash
+uname -m                         # must print aarch64
+cat /etc/nv_tegra_release
+python3 --version                # 3.12 on the reference image
+```
+
+#### 1. Install the JetPack components and system prerequisites
+
+Install JetPack 7.2.1 using NVIDIA's current Orin Nano ISO/SDK Manager instructions, boot it, then:
+
+```bash
+sudo apt update
+sudo apt install -y nvidia-jetpack python3-venv python3-pip libopenblas-dev libgl1
+sudo reboot
+```
+
+Use an NVMe SSD when possible: model downloads and TensorRT engine caches are much more pleasant
+there than on a small microSD card. Select `MAXN SUPER` in the Jetson power-mode UI and use
+`sudo jetson_clocks` while benchmarking. Keep a fan attached; throttling makes timings misleading.
+
+#### 2. Create the Python environment
+
+JetPack 7 provides the CUDA/TensorRT system stack. Install a CUDA-enabled ARM64 PyTorch before
+RF-DETR, then the Jetson-specific requirements:
+
+```bash
+git clone https://github.com/Naturalpad-studio/InstantHMR.git
+cd InstantHMR
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install torch torchvision
+python -m pip install -r requirements-jetson.txt
+```
+
+This deliberately uses `onnxruntime-gpu 1.32` for its CUDA 13 / Linux ARM64 wheel. The desktop
+`onnxruntime-gpu[cuda,cudnn]==1.26.*` dependency has no aarch64 wheel and must not be used on this
+Jetson. Likewise, do not install `tensorrt-cu12`: JetPack already owns the TensorRT 10.16 libraries.
+
+Verify the accelerator stack before connecting the camera:
+
+```bash
+python tools/check_jetson.py
+```
+
+The required result is `CUDA available=True` and a `CUDAExecutionProvider`. A
+`TensorrtExecutionProvider` is optional for the first run: `--device cuda` works without it. If
+PyTorch reports CUDA false, replace it with a JetPack-compatible ARM64 build before continuing; a
+CPU-only PyTorch makes RF-DETR unusably slow.
+
+#### 3. Configure and verify Gemini 2
+
+Connect Gemini 2 directly to a USB 3 port using a USB 3 data cable. Confirm that the link is not
+falling back to 480 Mbit/s:
+
+```bash
+lsusb
+lsusb -t                       # the camera path should show 5000M or faster
+```
+
+Install Orbbec's Linux metadata and udev rules from the installed `pyorbbecsdk2` package:
+
+```bash
+python "$(python -c 'import os, pyorbbecsdk; print(os.path.join(os.path.dirname(pyorbbecsdk.__file__), "shared", "setup_env.py"))')"
+```
+
+Reconnect the camera (or reboot), then acquire one calibrated RGB frame:
+
+```bash
+python tools/check_jetson.py --camera
+```
+
+The native camera source requests RGB 1280x720 at 30 fps to avoid MJPEG decode cost. If that exact
+profile is unavailable on the installed firmware, it prints `SDK default profile` and safely
+converts RGB, BGR, MJPEG, YUYV, UYVY, I420, NV12 or NV21 to RGB. With multiple Orbbec cameras, pass
+`--serial SERIAL` to the check and `--orbbec-serial SERIAL` to the demo.
+
+#### 4. First live run (safe 8 GB preset)
+
+`--jetson` expands to `small`, `--fit 1`, RF-DETR `nano`, two people, detector stride 2 and a 2 GiB
+TensorRT workspace limit. Start with CUDA and no viewer so camera/inference problems are separated
+from GUI problems:
+
+```bash
+python demo.py --orbbec --jetson --device cuda --pose-filter one-euro --no-viewer
+```
+
+The console should print the Gemini 2 serial, firmware, selected stream, `fx/fy/cx/cy`, the
+effective focal used by InstantHMR, active ONNX Runtime provider, person count and stage timings.
+Unlike an ordinary `--camera 0`, `--orbbec` uses Orbbec SDK hardware timestamps and the selected
+colour profile's real calibration. The released ONNX graph accepts one focal value, so the adapter
+uses `(fx + fy) / 2` and passes the real `cx/cy` to CLIFF and the in-graph kinematic fit.
+
+For the local Rerun UI, omit `--no-viewer`:
+
+```bash
+python demo.py --orbbec --jetson --device cuda --pose-filter one-euro
+```
+
+For a headless Jetson, save an RRD without spawning the viewer, then copy it to a workstation:
+
+```bash
+python demo.py --orbbec --jetson --device cuda --no-viewer --save-rrd jetson-run.rrd
+rerun jetson-run.rrd             # run this on the workstation after copying the file
+```
+
+#### 5. Enable TensorRT
+
+Only after CUDA works, check that `TensorrtExecutionProvider` appears in
+`python tools/check_jetson.py`, then run:
+
+```bash
+python demo.py --orbbec --jetson --device tensorrt --pose-filter one-euro
+```
+
+The first run builds engines locally and can take several minutes. Never copy an RTX desktop engine
+cache to Jetson. Rebuild `models/trt_cache/` after changing JetPack, TensorRT, ONNX Runtime, model,
+fit mode or maximum-person count. If the TensorRT provider is missing, stay on `--device cuda` until
+a matching ONNX Runtime TensorRT build is installed; installing desktop `tensorrt-cu12` is not a
+valid fix on JetPack 7.
+
+The PyPI ARM64 wheel is sufficient for CUDA, but the providers compiled into a wheel can change.
+If the check reports CUDA but no TensorRT and you specifically need TensorRT, build the same ORT
+release on the Jetson against JetPack's libraries (allow roughly 15 GB of free disk space):
+
+```bash
+sudo apt install -y --no-install-recommends build-essential cmake git \
+  libopenblas-dev python3-dev python3-setuptools python3-wheel
+cd ..
+git clone --recursive --branch v1.32.0 --depth 1 https://github.com/microsoft/onnxruntime.git
+cd onnxruntime
+export CUDACXX=/usr/local/cuda/bin/nvcc
+./build.sh --config Release --update --build --parallel 1 --build_wheel --skip_tests \
+  --use_tensorrt --cuda_home /usr/local/cuda \
+  --cudnn_home /usr/lib/aarch64-linux-gnu \
+  --tensorrt_home /usr/lib/aarch64-linux-gnu \
+  --cmake_extra_defines CMAKE_CUDA_ARCHITECTURES=native \
+    onnxruntime_BUILD_UNIT_TESTS=OFF onnxruntime_USE_FLASH_ATTENTION=OFF \
+    onnxruntime_USE_MEMORY_EFFICIENT_ATTENTION=OFF
+python -m pip install --no-deps --force-reinstall build/Linux/Release/dist/onnxruntime_gpu-1.32.0-*.whl
+cd ../InstantHMR
+python tools/check_jetson.py
+```
+
+`--parallel 1` is intentional on the 8 GB board. Do not remove the existing wheel until this build
+succeeds; CUDA mode is the recovery path if the TensorRT build fails.
+
+#### Resource/quality presets
+
+| Goal | Recommended options |
+|---|---|
+| Balanced 8 GB live use | `--jetson` (small, fit1, detector nano, 2 people, stride 2) |
+| Lowest memory/latency | `--jetson --model nano --fit 0 --max-persons 1 --no-mesh --no-viewer` |
+| Better pose quality | `--jetson --model medium --fit 2 --max-persons 1` |
+| Faster detection | raise `--detector-stride` to `3` or `4` |
+| Full original desktop defaults | explicitly use `--model medium --fit 2 --detector medium --max-persons 4 --detector-stride 1` |
+
+`--no-viewer` now skips Rerun initialization and per-frame serialization unless `--save-rrd` is
+also present. `--no-mesh` now also skips the 18,439-vertex MHR body output instead of merely hiding
+it. Live sources retain only the latest 1,800 timing samples rather than growing an unbounded list.
+These are useful recovery options if the process is killed under memory pressure.
+
+Gemini 2 is an RGB-D camera, but InstantHMR is trained as a monocular RGB model. This adapter does
+not replace `cam_trans` with a depth-box median: that measures the visible clothing surface rather
+than the MHR body origin and produces a systematic translation error. Depth fusion requires an
+aligned depth stream plus a rendered-mesh-to-depth fit and is intentionally kept separate from a
+faithful InstantHMR reproduction.
+
+#### Jetson/Gemini troubleshooting
+
+- **`no Orbbec camera found` or permission denied:** rerun `shared/setup_env.py`, reconnect the
+  camera, check `lsusb -t`, avoid charge-only cables and unpowered hubs.
+- **Requested RGB profile falls back:** update Gemini 2 firmware/SDK, or specify a supported
+  `--orbbec-width`, `--orbbec-height` and `--orbbec-fps`. The fallback is valid but MJPEG may use
+  more CPU.
+- **`CUDAExecutionProvider` missing:** the desktop ORT wheel or a CPU build was installed. Recreate
+  the environment with `requirements-jetson.txt` and verify JetPack 7/Python 3.12/aarch64.
+- **`TensorrtExecutionProvider` missing:** use `--device cuda`; TensorRT acceleration is optional,
+  and the installed ORT wheel must match JetPack's CUDA/TensorRT ABI.
+- **Out of memory / process killed:** use `--no-viewer`, `--no-mesh`, `--max-persons 1`, detector
+  `nano`, `--fit 0` or `1`, close the Ubuntu desktop/browser, and reduce camera resolution. Swap can
+  help CPU allocations but does not create GPU bandwidth.
+- **TensorRT engine fails after an upgrade:** remove only `models/trt_cache/` and let this device
+  rebuild it. Engine files are hardware and software-stack specific.
+- **First run cannot download weights:** download the ONNX graphs and `mhr-body.onnx` on a connected
+  machine, place them together, and pass the local model with `--model /path/model.onnx`.
+
 ## Demo
 
 ```bash
 python demo.py --image photo.jpg
 python demo.py --video clip.mp4 --pose-filter one-euro
 python demo.py --camera 0 --model small --fit 1
+python demo.py --orbbec --jetson --pose-filter one-euro
 ```
 
 The [Rerun](https://rerun.io) viewer opens with the frame and its 2D skeletons, the 3D scene, and
@@ -106,11 +314,18 @@ detector, then InstantHMR runs on each of them.
 | `--pose-filter` | videos and cameras: `one-euro` or `alpha-beta` filters each person's pose before the mesh is built; both were tuned on 3DPW and EgoHumans, lower the error slightly and the jitter by a third, and lag less than half a frame |
 | `--smooth` | videos and cameras: smooths the keypoints and mesh instead; steadier still, but it lags on fast motion |
 | `--focal` | the camera's focal length in pixels, if you know it; it places people at the right depth |
+| `--principal-point` | camera `cx cy` in pixels; Gemini 2 supplies this automatically |
+| `--orbbec` | capture Gemini 2 with Orbbec SDK v2, including calibration and hardware timestamps |
+| `--orbbec-serial` | choose one Orbbec device when several are connected |
+| `--orbbec-width`, `--orbbec-height`, `--orbbec-fps` | requested colour profile (1280x720 at 30 fps by default) |
+| `--jetson` | safe Orin Nano 8 GB model/detector/batch/workspace preset |
+| `--trt-workspace-gb` | TensorRT workspace cap; the Jetson preset uses 2 GiB |
 | `--detector` | RF-DETR size: `nano`, `small`, `medium` (default), `base`, `large` |
 | `--max-persons` | most people per frame (default 4) |
 | `--detector-stride` | run the detector every N frames; in between, each person's box follows their 2D keypoints |
-| `--no-mesh` | skeleton only |
+| `--no-mesh` | skeleton only; also skips full mesh generation |
 | `--save-rrd` | also save the recording, to replay with `rerun file.rrd` |
+| `--no-viewer` | headless mode; skips Rerun work unless `--save-rrd` is present |
 
 The latencies in the tables above are the model alone, as measured in the paper. The demo's timings
 are what a frame costs end to end in Python. On an RTX 4070 with TensorRT, the InstantHMR stage takes
@@ -149,6 +364,9 @@ device:
 pip install tensorrt-cu12==10.15.*
 python demo.py --camera 0 --device tensorrt
 ```
+
+That pip command is for CUDA 12 desktop installations. On Jetson, use the TensorRT supplied by
+JetPack and follow the Jetson section above; do not install `tensorrt-cu12` over it.
 
 The first run builds an engine for your GPU and caches it in `models/trt_cache/`: about two
 minutes for a network graph (it covers batches of up to `--max-persons` people), and four to ten
