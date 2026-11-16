@@ -3,6 +3,8 @@
 # requirements-jetson.txt for that device.
 -r requirements.txt
 
+onnx>=1.17,<2
+
 rfdetr==1.12.1
 pyorbbecsdk2>=2.1,<3
 # pyorbbecsdk2 pins PyAV 12.3; supervision 0.30+ requests an incompatible PyAV >=14.2.

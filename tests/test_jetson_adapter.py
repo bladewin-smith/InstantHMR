@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import importlib.util
 import sys
+import tempfile
 import types
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import cv2
@@ -11,7 +14,8 @@ import numpy as np
 from demo import parse_args
 from instanthmr.camera_orbbec import OrbbecGemini2Source, _frame_to_rgb
 from instanthmr.detector import PersonDetector
-from instanthmr.inference import HMRPrediction, InstantHMR
+from instanthmr.inference import HMRPrediction, InstantHMR, _fit_providers, _session_options, providers_for
+from instanthmr.onnx_compat import rewrite_asymmetric_conv_padding
 from tools.check_jetson import classify_stack, dependency_pin_issues
 
 
@@ -156,6 +160,71 @@ class PredictionTests(unittest.TestCase):
         self.assertIsNone(prediction.vertices_cam)
 
 
+class ProviderTests(unittest.TestCase):
+    def setUp(self):
+        self.ort = types.SimpleNamespace(
+            get_available_providers=lambda: ["TensorrtExecutionProvider", "CUDAExecutionProvider",
+                                             "CPUExecutionProvider"]
+        )
+
+    def test_cuda_algorithm_is_forwarded_to_ort(self):
+        with patch.dict(sys.modules, {"onnxruntime": self.ort}):
+            providers = providers_for("cuda", cuda_conv_algo="HEURISTIC")
+        self.assertEqual(providers[0], ("CUDAExecutionProvider", {"cudnn_conv_algo_search": "HEURISTIC"}))
+
+    def test_fit_graph_combines_cuda_graph_and_algorithm_options(self):
+        with patch.dict(sys.modules, {"onnxruntime": self.ort}):
+            providers = _fit_providers("cuda", "model", cuda_conv_algo="HEURISTIC")
+        self.assertEqual(providers[0], ("CUDAExecutionProvider", {
+            "enable_cuda_graph": "1", "cudnn_conv_algo_search": "HEURISTIC",
+        }))
+
+    def test_compat_session_preserves_explicit_padding(self):
+        class Options:
+            def __init__(self):
+                self.config = {}
+
+            def add_session_config_entry(self, key, value):
+                self.config[key] = value
+
+        fake = types.SimpleNamespace(SessionOptions=Options,
+                                     GraphOptimizationLevel=types.SimpleNamespace(ORT_ENABLE_ALL=99))
+        options = _session_options(fake, preserve_explicit_padding=True)
+        self.assertEqual(options.config["optimization.disable_specified_optimizers"],
+                         "PadFusion;NchwcTransformer")
+
+
+@unittest.skipUnless(importlib.util.find_spec("onnx"), "onnx is only required by the Jetson deployment")
+class OnnxCompatibilityTests(unittest.TestCase):
+    def test_asymmetric_conv_is_rewritten_and_numerically_equivalent(self):
+        import onnx
+        from onnx import TensorProto, helper
+        from onnx.reference import ReferenceEvaluator
+
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as directory:
+            root = Path(directory)
+            source = root / "asymmetric.onnx"
+            x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 1, 4, 4])
+            y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 1, 4, 4])
+            weight = helper.make_tensor("weight", TensorProto.FLOAT, [1, 1, 2, 2], [1, 2, 3, 4])
+            conv = helper.make_node("Conv", ["x", "weight"], ["y"], name="conv", pads=[0, 0, 1, 1])
+            model = helper.make_model(helper.make_graph([conv], "test", [x], [y], [weight]),
+                                      opset_imports=[helper.make_opsetid("", 13)])
+            onnx.save_model(model, source)
+            sample = np.arange(16, dtype=np.float32).reshape(1, 1, 4, 4)
+            expected = ReferenceEvaluator(model).run(None, {"x": sample})[0]
+
+            rewritten_path = rewrite_asymmetric_conv_padding(source, root / "cache")
+            rewritten = onnx.load(rewritten_path)
+            actual = ReferenceEvaluator(rewritten).run(None, {"x": sample})[0]
+
+            np.testing.assert_allclose(actual, expected)
+            self.assertEqual([node.op_type for node in rewritten.graph.node], ["Pad", "Conv"])
+            pads = next(attr.ints for attr in rewritten.graph.node[1].attribute if attr.name == "pads")
+            self.assertEqual(list(pads), [0, 0, 0, 0])
+            self.assertEqual(rewrite_asymmetric_conv_padding(source, root / "cache"), rewritten_path)
+
+
 class CliTests(unittest.TestCase):
     def test_jetson_preset_and_explicit_override(self):
         with patch.object(sys, "argv", ["demo.py", "--orbbec", "--jetson", "--fit", "0"]):
@@ -166,6 +235,15 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.max_persons, 2)
         self.assertEqual(args.detector_stride, 2)
         self.assertEqual(args.trt_workspace_gb, 2.0)
+        self.assertEqual(args.cuda_conv_algo, "HEURISTIC")
+        self.assertTrue(args.onnx_pad_fix)
+
+    def test_jetson_compatibility_options_can_be_overridden(self):
+        with patch.object(sys, "argv", ["demo.py", "--orbbec", "--jetson",
+                                        "--cuda-conv-algo", "DEFAULT", "--no-onnx-pad-fix"]):
+            args = parse_args()
+        self.assertEqual(args.cuda_conv_algo, "DEFAULT")
+        self.assertFalse(args.onnx_pad_fix)
 
 
 class JetsonEnvironmentTests(unittest.TestCase):
@@ -182,7 +260,7 @@ class JetsonEnvironmentTests(unittest.TestCase):
     @patch("tools.check_jetson.package_version")
     def test_rejects_transformers_5_on_verified_jetpack_6(self, package_version):
         versions = {
-            "rfdetr": "1.12.1", "transformers": "5.20.2", "huggingface-hub": "2.4.0",
+            "onnx": "1.17.0", "rfdetr": "1.12.1", "transformers": "5.20.2", "huggingface-hub": "2.4.0",
             "tokenizers": "0.23.3", "supervision": "0.29.1", "av": "12.3.0",
         }
         package_version.side_effect = versions.get
@@ -193,7 +271,7 @@ class JetsonEnvironmentTests(unittest.TestCase):
     @patch("tools.check_jetson.package_version")
     def test_accepts_complete_jetpack_6_detector_pin_set(self, package_version):
         versions = {
-            "rfdetr": "1.5.1", "transformers": "4.57.3", "huggingface-hub": "0.36.0",
+            "onnx": "1.17.0", "rfdetr": "1.5.1", "transformers": "4.57.3", "huggingface-hub": "0.36.0",
             "tokenizers": "0.22.1", "supervision": "0.29.1", "av": "12.3.0",
         }
         package_version.side_effect = versions.get

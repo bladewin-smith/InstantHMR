@@ -20,6 +20,7 @@ FOCAL_FALLBACK_DIAG = 1.05
 # boxes are tighter (median long side 0.866 of the ground-truth box), so they are enlarged by this factor first.
 DETECTOR_TO_GT_BOX = 1 / 0.866
 DEVICES = ("cuda", "tensorrt", "cpu", "coreml")
+CUDA_CONV_ALGOS = ("EXHAUSTIVE", "HEURISTIC", "DEFAULT")
 
 
 @dataclass
@@ -49,10 +50,15 @@ class HMRPrediction:
 
 
 def providers_for(device: str, max_batch: int = 1, image_size: int = 288,
-                  cache_dir: str | Path = "models/trt_cache", trt_workspace_size: int | None = None) -> list:
+                  cache_dir: str | Path = "models/trt_cache", trt_workspace_size: int | None = None,
+                  cuda_conv_algo: str | None = None) -> list:
     """onnxruntime execution providers for a device name, always ending on the CPU."""
     import onnxruntime as ort
 
+    if cuda_conv_algo is not None and cuda_conv_algo not in CUDA_CONV_ALGOS:
+        raise ValueError(f"cuda_conv_algo must be one of {CUDA_CONV_ALGOS}, got {cuda_conv_algo!r}")
+    cuda = (("CUDAExecutionProvider", {"cudnn_conv_algo_search": cuda_conv_algo})
+            if cuda_conv_algo else "CUDAExecutionProvider")
     available = set(ort.get_available_providers())
     if device == "tensorrt":
         if "TensorrtExecutionProvider" not in available:
@@ -65,14 +71,26 @@ def providers_for(device: str, max_batch: int = 1, image_size: int = 288,
                "trt_profile_opt_shapes": shape(max_batch), "trt_profile_max_shapes": shape(max_batch)}
         if trt_workspace_size is not None:
             trt["trt_max_workspace_size"] = int(trt_workspace_size)
-        return [("TensorrtExecutionProvider", trt), "CUDAExecutionProvider", "CPUExecutionProvider"]
+        return [("TensorrtExecutionProvider", trt), cuda, "CPUExecutionProvider"]
     if device == "cuda":
         if "CUDAExecutionProvider" not in available:
             raise RuntimeError("CUDA is not available in this onnxruntime build: install onnxruntime-gpu")
-        return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        return [cuda, "CPUExecutionProvider"]
     if device == "coreml" and "CoreMLExecutionProvider" in available:
         return ["CoreMLExecutionProvider", "CPUExecutionProvider"]
     return ["CPUExecutionProvider"]
+
+
+def _session_options(ort, preserve_explicit_padding: bool = False):
+    options = ort.SessionOptions()
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    options.log_severity_level = 3
+    if preserve_explicit_padding:
+        # ORT's PadFusion (and the CPU NCHWc layout rewrite) would otherwise fold our explicit
+        # Pad back into the Conv and recreate the asymmetric graph this compatibility path avoids.
+        options.add_session_config_entry("optimization.disable_specified_optimizers",
+                                         "PadFusion;NchwcTransformer")
+    return options
 
 
 class InstantHMR:
@@ -84,13 +102,16 @@ class InstantHMR:
     graph does, else on the CPU. `focal` is the camera focal length in pixels when it is known; otherwise
     1.05 x the image diagonal is assumed. `principal_point` defaults to the image centre. `max_batch` is the
     most people predicted in one call. `pose_filter` (smoothing.PoseFilter) filters each person's pose across
-    frames before the mesh is built. `return_mesh=False` skips the full vertex output.
+    frames before the mesh is built. `return_mesh=False` skips the full vertex output. `cuda_conv_algo` selects
+    ORT's cuDNN search. `rewrite_asymmetric_padding=True` creates and uses a cached graph compatible with
+    affected cuDNN 9.x frontends without changing the source graph.
     """
 
     def __init__(self, model_path: str | Path, body_path: str | Path | None = None, device: str = "cuda",
                  focal: float | None = None, principal_point: tuple[float, float] | None = None,
                  max_batch: int = 4, pose_filter=None, return_mesh: bool = True,
-                 trt_workspace_size: int | None = None):
+                 trt_workspace_size: int | None = None, cuda_conv_algo: str | None = None,
+                 rewrite_asymmetric_padding: bool = False):
         import onnxruntime as ort
 
         from .models import resolve_body
@@ -100,10 +121,14 @@ class InstantHMR:
         if hasattr(ort, "preload_dlls"):
             ort.preload_dlls()
         ort.set_default_logger_severity(3)
-        options = ort.SessionOptions()
-        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        options.log_severity_level = 3
+        options = _session_options(ort, preserve_explicit_padding=rewrite_asymmetric_padding)
 
+        source_model_path = Path(model_path)
+        body_path = Path(body_path) if body_path else resolve_body(source_model_path)
+        if rewrite_asymmetric_padding:
+            from .onnx_compat import rewrite_asymmetric_conv_padding
+
+            model_path = rewrite_asymmetric_conv_padding(source_model_path)
         probe = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
         meta = probe.get_modelmeta().custom_metadata_map
         self.input_size = int(meta.get("image_size", 288))
@@ -112,9 +137,11 @@ class InstantHMR:
         self.scales = tuple(float(v) for v in meta["crop_scales"].split(",")) if self.n_crops else (1.0,)
         del probe
         if self.n_crops:
-            providers = _fit_providers(device, Path(model_path).stem, trt_workspace_size=trt_workspace_size)
+            providers = _fit_providers(device, Path(model_path).stem, trt_workspace_size=trt_workspace_size,
+                                       cuda_conv_algo=cuda_conv_algo)
         else:
-            providers = providers_for(device, max_batch, self.input_size, trt_workspace_size=trt_workspace_size)
+            providers = providers_for(device, max_batch, self.input_size, trt_workspace_size=trt_workspace_size,
+                                      cuda_conv_algo=cuda_conv_algo)
         self.network = ort.InferenceSession(str(model_path), sess_options=options, providers=providers)
         self.provider = self.network.get_providers()[0]
         self.focal = focal
@@ -126,9 +153,10 @@ class InstantHMR:
         if self.n_crops and self.provider == "CUDAExecutionProvider":
             self._bind_cuda_graph(ort)
 
-        body_path = Path(body_path) if body_path else resolve_body(Path(model_path))
         self.body = ort.InferenceSession(str(body_path), sess_options=options,
-                                         providers=providers_for("cuda" if device in ("cuda", "tensorrt") else "cpu"))
+                                         providers=providers_for(
+                                             "cuda" if device in ("cuda", "tensorrt") else "cpu",
+                                             cuda_conv_algo=cuda_conv_algo))
         self.faces = (np.frombuffer(base64.b64decode(self.body.get_modelmeta().custom_metadata_map["mesh_faces"]),
                                     "<i4").reshape(-1, 3) if return_mesh else None)
 
@@ -250,10 +278,11 @@ def _normalise(crop: np.ndarray) -> np.ndarray:
 
 
 def _fit_providers(device: str, name: str, cache_dir: str | Path = "models/trt_cache",
-                   trt_workspace_size: int | None = None) -> list:
+                   trt_workspace_size: int | None = None, cuda_conv_algo: str | None = None) -> list:
     """Providers for a fit graph (fixed shapes): TensorRT in fp16 with a cached engine, or ORT CUDA with CUDA graphs."""
     if device == "tensorrt":
-        providers = providers_for(device, trt_workspace_size=trt_workspace_size)  # checks the installation
+        providers = providers_for(device, trt_workspace_size=trt_workspace_size,
+                                  cuda_conv_algo=cuda_conv_algo)  # checks the installation
         cache = Path(cache_dir) / name
         cache.mkdir(parents=True, exist_ok=True)
         options = {"trt_fp16_enable": True, "trt_engine_cache_enable": True,
@@ -264,5 +293,10 @@ def _fit_providers(device: str, name: str, cache_dir: str | Path = "models/trt_c
         return [("TensorrtExecutionProvider", options), *providers[1:]]
     if device == "cuda":
         providers_for(device)
-        return [("CUDAExecutionProvider", {"enable_cuda_graph": "1"}), "CPUExecutionProvider"]
-    return providers_for(device)
+        options = {"enable_cuda_graph": "1"}
+        if cuda_conv_algo:
+            if cuda_conv_algo not in CUDA_CONV_ALGOS:
+                raise ValueError(f"cuda_conv_algo must be one of {CUDA_CONV_ALGOS}, got {cuda_conv_algo!r}")
+            options["cudnn_conv_algo_search"] = cuda_conv_algo
+        return [("CUDAExecutionProvider", options), "CPUExecutionProvider"]
+    return providers_for(device, cuda_conv_algo=cuda_conv_algo)

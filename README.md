@@ -156,7 +156,7 @@ python -m pip install -r requirements-jetson.txt
 ```
 
 The JetPack 6 file is intentionally independent of the desktop `requirements.txt` and pins NumPy
-1.26.4, OpenCV 4.10, RF-DETR 1.5.1, Transformers 4.57.3, Hugging Face Hub 0.36.0,
+1.26.4, OpenCV 4.10, ONNX 1.17.0, RF-DETR 1.5.1, Transformers 4.57.3, Hugging Face Hub 0.36.0,
 Supervision 0.29.1, PyAV 12.3.0, Rerun 0.22.1, `pyorbbecsdk2` 2.1.1 and ORT 1.20.0. These older
 versions are deliberate compatibility boundaries:
 
@@ -166,6 +166,8 @@ versions are deliberate compatibility boundaries:
   PyAV 14.2 or newer. RF-DETR 1.5.1 works with Supervision 0.29.1, which has no PyAV requirement.
 - Rerun 0.23 and newer require NumPy 2. Rerun 0.22.1 is the newest release compatible with this
   NumPy 1.26 deployment; InstantHMR includes shims for its older timeline and blueprint APIs.
+- ONNX is used only to create a cached, equivalent graph for the cuDNN 9.6 asymmetric-padding
+  workaround. It does not replace ONNX Runtime or any JetPack CUDA library.
 
 The ORT requirement is normally satisfied by the system-visible custom ARM64 installation; pip
 must not replace it. Do not run `pip install torch`, `torchvision`, `onnxruntime-gpu`, `tensorrt`,
@@ -196,7 +198,7 @@ python tools/check_jetson.py
 On the verified device the required lines are CUDA 12.6, cuDNN 90600, ORT 1.20.0 with
 `TensorrtExecutionProvider` and `CUDAExecutionProvider`, and `stack: JetPack 6 / CUDA 12`. The check
 also verifies a real CUDA allocation, torchvision, the complete RF-DETR/Transformers/Supervision/
-PyAV pin set, NumPy/OpenCV and distinguishes the Orbbec Python-wrapper version from its bundled SDK
+PyAV/ONNX pin set, NumPy/OpenCV and distinguishes the Orbbec Python-wrapper version from its bundled SDK
 runtime. A missing Rerun install is only allowed with `--no-viewer` and without `--save-rrd`.
 
 #### 3. Configure and verify Gemini 2
@@ -226,11 +228,19 @@ profile is unavailable on the installed firmware, it prints `SDK default profile
 converts RGB, BGR, MJPEG, YUYV, UYVY, I420, NV12 or NV21 to RGB. With multiple Orbbec cameras, pass
 `--serial SERIAL` to the check and `--orbbec-serial SERIAL` to the demo.
 
+Before starting the complete detector/camera pipeline, the following optional test downloads the
+same `small-fit1` graph used by the preset, applies the Jetson graph rewrite and performs one real
+CUDA prediction. It catches model/cuDNN problems that provider discovery alone cannot detect:
+
+```bash
+python tools/check_jetson.py --hmr-smoke
+```
+
 #### 4. First live run (safe 8 GB preset)
 
-`--jetson` expands to `small`, `--fit 1`, RF-DETR `nano`, two people, detector stride 2 and a 2 GiB
-TensorRT workspace limit. Start with CUDA and no viewer so camera/inference problems are separated
-from GUI problems:
+`--jetson` expands to `small`, `--fit 1`, RF-DETR `nano`, two people, detector stride 2, a 2 GiB
+TensorRT workspace limit, cuDNN `HEURISTIC` search and the ONNX asymmetric-padding fix. Start with
+CUDA and no viewer so camera/inference problems are separated from GUI problems:
 
 ```bash
 python demo.py --orbbec --jetson --device cuda --pose-filter one-euro --no-viewer
@@ -241,6 +251,11 @@ effective focal used by InstantHMR, active ONNX Runtime provider, person count a
 Unlike an ordinary `--camera 0`, `--orbbec` uses Orbbec SDK hardware timestamps and the selected
 colour profile's real calibration. The released ONNX graph accepts one focal value, so the adapter
 uses `(fx + fy) / 2` and passes the real `cx/cy` to CLIFF and the in-graph kinematic fit.
+
+On the first run, the fix changes each asymmetric Conv into the mathematically equivalent explicit
+zero Pad plus unpadded Conv and caches the result in `models/onnx_compat/`. The downloaded model is
+never overwritten. This avoids the `CUDNN_FE ... HEURISTIC_QUERY_FAILED` failure seen with cuDNN
+9.6 on the first FP16 stem convolution; later runs reuse the cached graph.
 
 For the local Rerun UI, omit `--no-viewer`:
 
@@ -270,7 +285,9 @@ run is the final compatibility test for ORT 1.20.0 with the installed TensorRT 1
 with CUDA, then try TensorRT. If engine creation fails, keep using `--device cuda` and preserve the
 working packages while diagnosing the log.
 
-The first TensorRT run builds engines locally and can take several minutes. Never copy an RTX
+The first TensorRT run builds engines locally and can take several minutes (occasionally 10-20
+minutes on an Orin Nano). Do not press `Ctrl+Z` while it is quiet: that suspends the build rather
+than reporting a failure. Never copy an RTX
 desktop engine cache to Jetson. Rebuild `models/trt_cache/` after changing JetPack, TensorRT, ONNX
 Runtime, model, fit mode or maximum-person count. A JetPack 6 repair must target its CUDA 12 stack;
 do not install the JetPack 7 ORT 1.32 package or desktop `tensorrt-cu12` over JetPack.
@@ -322,12 +339,24 @@ faithful InstantHMR reproduction.
   satisfy Supervision 0.30+'s PyAV 14.2 request in the camera environment.
 - **Rerun asks for NumPy 2:** use the pinned Rerun 0.22.1. Newer Rerun belongs on a workstation or
   in a separate environment, not in this ROS/Orbbec JetPack 6 venv.
+- **Albumentations advertises 2.0.8:** this is only its online update notice. Keep the RF-DETR 1.5.1
+  dependency version; do not upgrade it in this venv. Set `NO_ALBUMENTATIONS_UPDATE=1` before the
+  command if the notice is distracting.
+- **Matplotlib says `Unable to import Axes3D`:** this warning comes from mixed Ubuntu/pip Matplotlib
+  files and does not affect RF-DETR, InstantHMR or headless output. Do not rebuild the environment
+  merely to remove it.
 - **Global `pip check` reports airo/TensorFlow conflicts:** these are pre-existing packages outside
   InstantHMR. Do not upgrade NumPy to 2 or downgrade the NVIDIA TensorFlow stack for this project;
   use the project venv and validate with `tools/check_jetson.py`.
 - **Out of memory / process killed:** use `--no-viewer`, `--no-mesh`, `--max-persons 1`, detector
   `nano`, `--fit 0` or `1`, close the Ubuntu desktop/browser, and reduce camera resolution. Swap can
   help CPU allocations but does not create GPU bandwidth.
+- **`CUDNN_FE failure 8: HEURISTIC_QUERY_FAILED` / `No valid engine configs for ConvFwd`:** this is
+  the cuDNN 9.6 asymmetric-padding frontend issue, not a bad camera or RF-DETR download. Update the
+  repository, install the updated `requirements-jetson.txt` (it adds ONNX 1.17.0), and keep
+  `--jetson` enabled. Do not replace JetPack's cuDNN independently. For diagnosis only,
+  `--no-onnx-pad-fix` disables the rewrite and `--cuda-conv-algo DEFAULT` selects cuDNN's much
+  slower fallback search.
 - **TensorRT engine fails after an upgrade:** remove only `models/trt_cache/` and let this device
   rebuild it. Engine files are hardware and software-stack specific.
 - **First run cannot download weights:** download the ONNX graphs and `mhr-body.onnx` on a connected
@@ -358,7 +387,9 @@ detector, then InstantHMR runs on each of them.
 | `--orbbec` | capture Gemini 2 with Orbbec SDK v2, including calibration and hardware timestamps |
 | `--orbbec-serial` | choose one Orbbec device when several are connected |
 | `--orbbec-width`, `--orbbec-height`, `--orbbec-fps` | requested colour profile (1280x720 at 30 fps by default) |
-| `--jetson` | safe Orin Nano 8 GB model/detector/batch/workspace preset; disables RF-DETR compilation |
+| `--jetson` | safe Orin Nano 8 GB model/detector/batch/workspace/cuDNN preset; disables RF-DETR compilation and enables the ONNX padding fix |
+| `--onnx-pad-fix`, `--no-onnx-pad-fix` | enable/disable the semantics-preserving asymmetric-Conv workaround |
+| `--cuda-conv-algo` | ORT cuDNN search: `EXHAUSTIVE`, `HEURISTIC` or `DEFAULT` (Jetson: `HEURISTIC`) |
 | `--trt-workspace-gb` | TensorRT workspace cap; the Jetson preset uses 2 GiB |
 | `--detector` | RF-DETR size: `nano`, `small`, `medium` (default), `base`, `large` |
 | `--max-persons` | most people per frame (default 4) |

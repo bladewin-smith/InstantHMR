@@ -7,6 +7,10 @@ numpy==1.26.4
 opencv-python==4.10.0.84
 opencv-python-headless==4.10.0.84
 
+# Used once to cache a semantically equivalent graph that avoids cuDNN 9.6's asymmetric-Conv
+# frontend failure.  The original downloaded ONNX graph is left untouched.
+onnx==1.17.0
+
 # RF-DETR 1.6+ requires Transformers 5, whose model backend rejects torch 2.5.  1.5.1 is the
 # last RF-DETR release on Transformers 4 and still provides RFDETRNano + legacy inference API.
 rfdetr==1.5.1

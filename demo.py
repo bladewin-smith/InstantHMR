@@ -35,6 +35,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fit", type=int, default=None, choices=(0, 1, 2),
                    help="kinematic fit on 1 or 2 crops per person, 0 for the network alone")
     p.add_argument("--device", default="cuda", choices=("cuda", "tensorrt", "cpu", "coreml"))
+    p.add_argument("--cuda-conv-algo", choices=("EXHAUSTIVE", "HEURISTIC", "DEFAULT"),
+                   help="ONNX Runtime cuDNN convolution search (Jetson preset: HEURISTIC)")
+    p.add_argument("--onnx-pad-fix", action=argparse.BooleanOptionalAction, default=None,
+                   help="rewrite asymmetric Conv padding for affected cuDNN releases (Jetson preset: on)")
     p.add_argument("--max-persons", type=int, default=None)
     p.add_argument("--detector", default=None, choices=("nano", "small", "medium", "base", "large"),
                    help="RF-DETR size")
@@ -67,12 +71,15 @@ def parse_args() -> argparse.Namespace:
         args.detector = args.detector or "nano"
         args.detector_stride = 2 if args.detector_stride is None else args.detector_stride
         args.trt_workspace_gb = 2.0 if args.trt_workspace_gb is None else args.trt_workspace_gb
+        args.cuda_conv_algo = args.cuda_conv_algo or "HEURISTIC"
+        args.onnx_pad_fix = True if args.onnx_pad_fix is None else args.onnx_pad_fix
     else:
         args.model = args.model or DEFAULT_MODEL
         args.fit = DEFAULT_FIT if args.fit is None else args.fit
         args.max_persons = 4 if args.max_persons is None else args.max_persons
         args.detector = args.detector or "medium"
         args.detector_stride = 1 if args.detector_stride is None else args.detector_stride
+        args.onnx_pad_fix = False if args.onnx_pad_fix is None else args.onnx_pad_fix
     if args.max_persons < 1 or args.detector_stride < 1:
         p.error("--max-persons and --detector-stride must be at least 1")
     if args.focal is not None and args.focal <= 0:
@@ -132,13 +139,17 @@ def main() -> None:
     args = parse_args()
     fit = f", kinematic fit on {args.fit} crop{'s' if args.fit > 1 else ''}" if args.fit else ""
     print(f"loading InstantHMR ({args.model}{fit}) on {args.device} and RF-DETR {args.detector}...")
+    if args.onnx_pad_fix:
+        print(f"Jetson compatibility: asymmetric-padding rewrite enabled; "
+              f"cuDNN search={args.cuda_conv_algo or 'ORT default'}")
     principal = tuple(args.principal_point) if args.principal_point is not None else None
     workspace = (int(args.trt_workspace_gb * 1024 ** 3) if args.trt_workspace_gb is not None else None)
     pipeline = PosePipeline(args.model, fit=args.fit, device=args.device, detector=args.detector,
                             det_confidence=args.det_confidence, max_persons=args.max_persons,
                             detector_stride=args.detector_stride, focal=args.focal, principal_point=principal,
                             pose_filter=args.pose_filter, mesh=not args.no_mesh, trt_workspace_size=workspace,
-                            detector_compile=not args.jetson)
+                            detector_compile=not args.jetson, cuda_conv_algo=args.cuda_conv_algo,
+                            rewrite_asymmetric_padding=args.onnx_pad_fix)
     print(f"InstantHMR runs on {pipeline.hmr.provider}")
     viewer = (RerunVisualizer(pipeline.hmr.faces, args.mesh_alpha, spawn=not args.no_viewer,
                               save_path=args.save_rrd)

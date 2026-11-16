@@ -3,6 +3,7 @@
 
     python tools/check_jetson.py
     python tools/check_jetson.py --camera
+    python tools/check_jetson.py --hmr-smoke
 """
 from __future__ import annotations
 
@@ -30,7 +31,8 @@ def package_version(distribution: str) -> str | None:
         return None
 
 
-JP6_DETECTOR_PINS = {
+JP6_PACKAGE_PINS = {
+    "onnx": "1.17.0",
     "rfdetr": "1.5.1",
     "transformers": "4.57.3",
     "huggingface-hub": "0.36.0",
@@ -45,7 +47,7 @@ def dependency_pin_issues(requirements: str | None) -> list[str]:
     if requirements != "requirements-jetson.txt":
         return []
     issues = []
-    for distribution, expected in JP6_DETECTOR_PINS.items():
+    for distribution, expected in JP6_PACKAGE_PINS.items():
         actual = package_version(distribution)
         if actual is None:
             issues.append(f"{distribution} is missing (expected {expected})")
@@ -65,6 +67,8 @@ def l4t_release() -> str | None:
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--camera", action="store_true", help="open Gemini 2 and acquire one RGB frame")
+    p.add_argument("--hmr-smoke", action="store_true",
+                   help="download/load small-fit1 and run one CUDA prediction with the Jetson graph fix")
     p.add_argument("--serial", help="Orbbec serial number when more than one camera is connected")
     args = p.parse_args()
     failed = False
@@ -176,6 +180,19 @@ def main() -> int:
     if requirements == "requirements-jetson.txt" and rerun_version and rerun_version != "0.22.1":
         print(f"ERROR: Rerun {rerun_version} is incompatible with the JP6 NumPy 1.26 pin; use 0.22.1")
         failed = True
+
+    if args.hmr_smoke:
+        try:
+            from instanthmr.inference import InstantHMR
+            from instanthmr.models import resolve_model
+
+            hmr = InstantHMR(resolve_model("small", 1), device="cuda", max_batch=1, return_mesh=False,
+                             cuda_conv_algo="HEURISTIC", rewrite_asymmetric_padding=True)
+            hmr.warmup(1)
+            print(f"HMR smoke: small-fit1 prediction OK on {hmr.provider}")
+        except Exception as e:
+            print(f"ERROR: InstantHMR CUDA smoke test failed: {e}")
+            failed = True
 
     if args.camera:
         try:
