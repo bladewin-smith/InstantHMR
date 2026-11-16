@@ -91,6 +91,10 @@ it.
 
 ### NVIDIA Jetson Orin Nano 8 GB + Orbbec Gemini 2
 
+For a step-by-step Chinese guide covering hardware, installation, safe headless RRD recording,
+troubleshooting and the underlying technical principles, see
+[`docs/jetson-orin-nano-gemini2-guide.zh-CN.md`](docs/jetson-orin-nano-gemini2-guide.zh-CN.md).
+
 The Jetson path is an inference deployment: the live demo, 2D/3D keypoints and full MHR mesh are
 supported. Training the released models is not practical in the Orin Nano's 8 GB of shared memory;
 train on a workstation/server and deploy the exported ONNX files here.
