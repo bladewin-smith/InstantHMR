@@ -361,6 +361,9 @@ faithful InstantHMR reproduction.
   `python tools/check_jetson.py --hmr-smoke --cuda-conv-algo DEFAULT`.
 - **TensorRT engine fails after an upgrade:** remove only `models/trt_cache/` and let this device
   rebuild it. Engine files are hardware and software-stack specific.
+- **A cached model still times out on a Hugging Face `HEAD` request:** current code checks the local
+  snapshot first and only uses the network on a cache miss. On an older checkout, prefix the command
+  with `HF_HUB_OFFLINE=1` to force the same behaviour.
 - **First run cannot download weights:** download the ONNX graphs and `mhr-body.onnx` on a connected
   machine, place them together, and pass the local model with `--model /path/model.onnx`.
 

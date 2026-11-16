@@ -20,7 +20,13 @@ BODY = "mhr-body.onnx"
 def _download(filename: str) -> Path:
     from huggingface_hub import hf_hub_download
 
-    return Path(hf_hub_download(REPO_ID, filename))
+    # hf_hub_download normally sends a HEAD request even when the file is already cached.  Embedded
+    # deployments are often offline or behind an unreliable link, so use a valid local snapshot
+    # immediately and only contact the Hub on a genuine cache miss.
+    try:
+        return Path(hf_hub_download(REPO_ID, filename, local_files_only=True))
+    except FileNotFoundError:
+        return Path(hf_hub_download(REPO_ID, filename))
 
 
 def resolve_model(model: str | Path, fit: int = 0) -> Path:

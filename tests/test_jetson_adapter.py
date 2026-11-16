@@ -6,7 +6,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 
 import cv2
 import numpy as np
@@ -15,6 +15,7 @@ from demo import parse_args
 from instanthmr.camera_orbbec import OrbbecGemini2Source, _frame_to_rgb
 from instanthmr.detector import PersonDetector
 from instanthmr.inference import HMRPrediction, InstantHMR, _fit_providers, providers_for
+from instanthmr.models import REPO_ID, _download
 from instanthmr.onnx_compat import rewrite_asymmetric_conv_padding
 from tools.check_jetson import classify_stack, dependency_pin_issues
 
@@ -158,6 +159,23 @@ class PredictionTests(unittest.TestCase):
             image_shape=(40, 30), vertices_local=None,
         )
         self.assertIsNone(prediction.vertices_cam)
+
+
+class ModelCacheTests(unittest.TestCase):
+    def test_cached_model_does_not_contact_hugging_face(self):
+        download = Mock(return_value="/cache/model.onnx")
+        with patch.dict(sys.modules, {"huggingface_hub": types.SimpleNamespace(hf_hub_download=download)}):
+            self.assertEqual(_download("model.onnx"), Path("/cache/model.onnx"))
+        download.assert_called_once_with(REPO_ID, "model.onnx", local_files_only=True)
+
+    def test_cache_miss_downloads_from_hugging_face(self):
+        download = Mock(side_effect=[FileNotFoundError, "/cache/model.onnx"])
+        with patch.dict(sys.modules, {"huggingface_hub": types.SimpleNamespace(hf_hub_download=download)}):
+            self.assertEqual(_download("model.onnx"), Path("/cache/model.onnx"))
+        self.assertEqual(download.call_args_list, [
+            call(REPO_ID, "model.onnx", local_files_only=True),
+            call(REPO_ID, "model.onnx"),
+        ])
 
 
 class ProviderTests(unittest.TestCase):
